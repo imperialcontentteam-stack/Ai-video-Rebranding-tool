@@ -514,10 +514,6 @@ def draw_intro_overlay(
     pill_x = TARGET_WIDTH // 2 - pill_w // 2
     pill_y = PILL_CENTER_Y - pill_h // 2
 
-        [pill_x + 6, pill_y + 8, pill_x + pill_w + 6, pill_y + pill_h + 8],
-    )
-    draw = ImageDraw.Draw(overlay, "RGBA")
-
     draw.rounded_rectangle(
         [pill_x, pill_y, pill_x + pill_w, pill_y + pill_h],
         radius=44, fill=(*pill_bg, 255),
@@ -633,16 +629,6 @@ def create_intro_clip_with_overlay(
         pill_h = 88
         pill_x = TARGET_WIDTH // 2 - pill_w // 2
         pill_y = PILL_CENTER_Y - pill_h // 2
-
-        shadow_img = Image.new("RGBA", (TARGET_WIDTH, TARGET_HEIGHT), (0, 0, 0, 0))
-        sdraw = ImageDraw.Draw(shadow_img)
-        sdraw.rounded_rectangle(
-            [pill_x + 6, pill_y + 8, pill_x + pill_w + 6, pill_y + pill_h + 8],
-            radius=44, fill=(30, 10, 60, 75),
-        )
-        shadow_img = shadow_img.filter(ImageFilter.GaussianBlur(7))
-        overlay_img = Image.alpha_composite(overlay_img, shadow_img)
-        draw = ImageDraw.Draw(overlay_img, "RGBA")
 
         draw.rounded_rectangle([pill_x, pill_y, pill_x + pill_w, pill_y + pill_h], radius=44, fill=(*pill_bg_c, 255))
         draw.rounded_rectangle([pill_x, pill_y, pill_x + pill_w, pill_y + pill_h], radius=44, outline=(*pill_text_c, 90), width=5)
