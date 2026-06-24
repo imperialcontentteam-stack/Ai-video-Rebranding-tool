@@ -2,19 +2,18 @@ from __future__ import annotations
 
 import io
 import hashlib
-import json
 import os
 import re
 import shutil
 import subprocess
 import tempfile
-import traceback
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
 
 import cv2
+import numpy as np
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
@@ -36,54 +35,47 @@ SPEED_PROFILES = {
 }
 DEFAULT_SPEED_MODE = "Fast (recommended)"
 
-# Hard-coded actual rendered SLC logo footprint.
-# These coordinates are used on the final normalized 1920x1080 video.
-# The tool covers exactly this area, then overlays the brand logo at the same
-# x/y with the same rendered size.
-FIXED_SLC_LOGO_BOX = (1722, 966, 106, 60)  # x, y, width, height
+# Hard-coded SLC logo box in the content video
+FIXED_SLC_LOGO_BOX = (1722, 966, 106, 60)
 FIXED_SLC_COVER_COLOR = "#FFFFFF"
 FIXED_SLC_COVER_BLEED = 0
 
-INTRO_DURATION = 5.0
+# -----------------------------------------------------------------
+# Intro video text regions (pixel-analysed from aspirex_intro.mp4)
+# -----------------------------------------------------------------
+# Original title text occupies Y≈381-436, X≈260-1720.
+# We fill a wider band to also cover shadow & anti-aliasing.
+TITLE_ERASE_Y = 260    # top of erase band
+TITLE_ERASE_H = 210    # fills Y 255-470
 
-# Cover page template/layout copied from the provided Intro.mp4.
-# This keeps the course title, unit pill, logo position, sizes, and spacing fixed.
-INTRO_COVER_TEMPLATE_NAME = "intro_cover_template.png"
-COVER_TITLE_FONT_SIZE = 52
-COVER_TITLE_MIN_FONT_SIZE = 28
-COVER_TITLE_MAX_WIDTH = 1300
-COVER_TITLE_TOP_Y = 360
-COVER_TITLE_LINE_STEP = 68
-COVER_TITLE_FONT_NAME = "Poppins-Bold.ttf"
-COVER_UNIT_FONT_SIZE = 50
-COVER_UNIT_MIN_FONT_SIZE = 34
-COVER_UNIT_TEXT_MAX_WIDTH = 980
-COVER_PILL_Y = 612
-COVER_PILL_HEIGHT = 102
-COVER_PILL_MIN_WIDTH = 650
-COVER_PILL_MAX_WIDTH = 1180
-COVER_LOGO_CENTER = (960, 933)
-COVER_LOGO_MAX_SIZE = (250, 70)
-COVER_LOGO_CLEANUP_BOX = (760, 875, 400, 125)
+# New title rendered inside this band:
+TITLE_TEXT_CENTER_Y = 375   # vertical centre for new title text
+
+# Original pill (white rounded rect) Y≈478-565, centre X=960.
+# Shadow extends to ~Y 590. Fill band must cover all of this.
+PILL_ERASE_Y  = 455    # top of erase band
+PILL_ERASE_H  = 160    # fills Y 468-608
+
+# New pill rendered inside this band:
+PILL_CENTER_Y = 540    # vertical centre for new pill
+PILL_MIN_W    = 570    # minimum pill width to cover original
 
 BRANDS = {
     "Aspirex": {
         "prefix": "aspirex",
         "logo": "aspirex_logo.png",
         "bg": "0x9051D9",
-        "intro_bg": "#9654DD",
-        "intro_accent": "#6D32B5",
-        "intro_text": "#FFFFFF",
-        "intro_pill_text": "#6D32B5",
+        "intro_text_color": (255, 255, 255),      # white title
+        "pill_bg_color": (255, 255, 255),          # white pill bg
+        "pill_text_color": (109, 50, 181),         # purple pill text
     },
     "GEL": {
         "prefix": "gel",
         "logo": "gel_logo.png",
         "bg": "0xF7FBFF",
-        "intro_bg": "#F7FBFF",
-        "intro_accent": "#29ABE2",
-        "intro_text": "#1A2E4A",
-        "intro_pill_text": "#1A2E4A",
+        "intro_text_color": (26, 46, 74),
+        "pill_bg_color": (255, 255, 255),
+        "pill_text_color": (26, 46, 74),
     },
 }
 
@@ -104,7 +96,6 @@ class MediaInfo:
 # File and media helpers
 # -----------------------------------------------------------------------------
 
-
 def get_base() -> Path:
     return Path(__file__).resolve().parent
 
@@ -123,57 +114,37 @@ _FFMPEG_EXE: Optional[str] = None
 
 
 def get_ffmpeg_exe() -> str:
-    """Return a working FFmpeg executable.
-
-    The old version required system ffmpeg + ffprobe on PATH. This version first
-    tries system FFmpeg, then falls back to imageio-ffmpeg from requirements.txt.
-    That makes the tool work on machines where FFmpeg is not installed globally.
-    """
     global _FFMPEG_EXE
     if _FFMPEG_EXE:
         return _FFMPEG_EXE
-
     candidates: list[str] = []
-
     env_value = os.environ.get("FFMPEG_BINARY", "").strip()
     if env_value:
         candidates.append(env_value)
-
     system_value = shutil.which("ffmpeg")
     if system_value:
         candidates.append(system_value)
-
     try:
         import imageio_ffmpeg
-
         bundled_value = imageio_ffmpeg.get_ffmpeg_exe()
         if bundled_value:
             candidates.append(bundled_value)
     except Exception:
         pass
-
     seen: set[str] = set()
     for candidate in candidates:
         if not candidate or candidate in seen:
             continue
         seen.add(candidate)
         try:
-            result = subprocess.run(
-                [candidate, "-version"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
+            result = subprocess.run([candidate, "-version"], capture_output=True, text=True, timeout=10)
             if result.returncode == 0:
                 _FFMPEG_EXE = candidate
                 return candidate
         except Exception:
             continue
-
     raise RuntimeError(
-        "FFmpeg is not available. Run `pip install -r requirements.txt` first. "
-        "This version includes imageio-ffmpeg as an automatic FFmpeg fallback. "
-        "If your platform blocks that fallback, install FFmpeg manually and make sure `ffmpeg` is on PATH."
+        "FFmpeg is not available. Run `pip install -r requirements.txt` first."
     )
 
 
@@ -197,8 +168,7 @@ def run_cmd(cmd: list[str], label: str) -> None:
 def ffmpeg_probe_text(path: Path) -> str:
     result = subprocess.run(
         prepare_ffmpeg_cmd(["ffmpeg", "-hide_banner", "-i", str(path)]),
-        capture_output=True,
-        text=True,
+        capture_output=True, text=True,
     )
     return (result.stderr or "") + "\n" + (result.stdout or "")
 
@@ -207,14 +177,10 @@ def parse_duration_from_ffmpeg_output(text: str) -> float:
     match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", text)
     if not match:
         return 0.0
-    hours = int(match.group(1))
-    minutes = int(match.group(2))
-    seconds = float(match.group(3))
-    return hours * 3600 + minutes * 60 + seconds
+    return int(match.group(1)) * 3600 + int(match.group(2)) * 60 + float(match.group(3))
 
 
 def parse_video_size_from_ffmpeg_output(text: str) -> tuple[int, int]:
-    # Look only near Video stream lines to avoid matching bitrates or unrelated numbers.
     for line in text.splitlines():
         if "Video:" not in line:
             continue
@@ -228,7 +194,6 @@ def get_media_info(path: Path) -> MediaInfo:
     duration = 0.0
     width = 0
     height = 0
-
     cap = cv2.VideoCapture(str(path))
     if cap.isOpened():
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
@@ -238,18 +203,14 @@ def get_media_info(path: Path) -> MediaInfo:
         if fps > 0 and frame_count > 0:
             duration = frame_count / fps
     cap.release()
-
     probe_text = ffmpeg_probe_text(path)
     has_audio = bool(re.search(r"Stream #.*Audio:", probe_text))
-
     if duration <= 0:
         duration = parse_duration_from_ffmpeg_output(probe_text)
-
     if width <= 0 or height <= 0:
         probed_w, probed_h = parse_video_size_from_ffmpeg_output(probe_text)
         width = width or probed_w
         height = height or probed_h
-
     return MediaInfo(duration=duration, width=width, height=height, has_audio=has_audio)
 
 
@@ -284,10 +245,8 @@ def safe_output_name(value: str, fallback_stem: str, brand: str) -> str:
 
 
 def ffmpeg_color_from_hex(hex_color: str, opacity: float = 1.0) -> str:
-    value = (hex_color or "#FFFFFF").strip()
-    if value.startswith("#"):
-        value = value[1:]
-    if len(value) != 6 or any(c not in "0123456789abcdefABCDEF" for c in value):
+    value = (hex_color or "#FFFFFF").strip().lstrip("#")
+    if len(value) != 6:
         value = "FFFFFF"
     alpha = max(0.0, min(float(opacity), 1.0))
     return f"0x{value}@{alpha:.3f}"
@@ -297,17 +256,16 @@ def get_speed_profile(speed_mode: str) -> dict:
     return SPEED_PROFILES.get(speed_mode, SPEED_PROFILES[DEFAULT_SPEED_MODE])
 
 
-def video_encoding_args(speed_mode: str = DEFAULT_SPEED_MODE, crf: Optional[int] = None, preset: Optional[str] = None) -> list[str]:
+def video_encoding_args(speed_mode: str = DEFAULT_SPEED_MODE, crf: Optional[int] = None) -> list[str]:
     profile = get_speed_profile(speed_mode)
-    chosen_preset = preset or str(profile["preset"])
+    preset = str(profile["preset"])
     chosen_crf = int(crf if crf is not None else profile["crf"])
-    return ["-c:v", "libx264", "-preset", chosen_preset, "-crf", str(chosen_crf)]
+    return ["-c:v", "libx264", "-preset", preset, "-crf", str(chosen_crf)]
 
 
 # -----------------------------------------------------------------------------
 # Preview helpers
 # -----------------------------------------------------------------------------
-
 
 def extract_frame(video_path: Path, seconds: float = 0.0):
     cap = cv2.VideoCapture(str(video_path))
@@ -347,33 +305,25 @@ def draw_fixed_logo_box(frame):
 
 
 # -----------------------------------------------------------------------------
-# Intro image helpers
+# Font helpers
 # -----------------------------------------------------------------------------
 
-
-def find_font(bold: bool = True) -> str | None:
-    # Prefer Poppins-Bold.ttf for the cover page text.
-    # The font file is not bundled; place it beside app.py or in assets/fonts if
-    # it is not already installed on the machine running Streamlit.
+def find_font(bold: bool = True) -> Optional[str]:
     base = get_base()
     env_font = os.environ.get("POPPINS_BOLD_FONT", "").strip()
+    suffix = "Bold" if bold else "Regular"
     candidates = [
         env_font if bold else "",
-        str(base / COVER_TITLE_FONT_NAME) if bold else "",
-        str(base / "assets" / "fonts" / COVER_TITLE_FONT_NAME) if bold else "",
-        str(base / "fonts" / COVER_TITLE_FONT_NAME) if bold else "",
-        "Poppins-Bold.ttf" if bold else "Poppins-Regular.ttf",
-        "/usr/share/fonts/truetype/poppins/Poppins-Bold.ttf" if bold else "/usr/share/fonts/truetype/poppins/Poppins-Regular.ttf",
-        "/usr/local/share/fonts/Poppins-Bold.ttf" if bold else "/usr/local/share/fonts/Poppins-Regular.ttf",
-        str(Path.home() / ".fonts" / "Poppins-Bold.ttf") if bold else str(Path.home() / ".fonts" / "Poppins-Regular.ttf"),
-        "/Library/Fonts/Poppins-Bold.ttf" if bold else "/Library/Fonts/Poppins-Regular.ttf",
-        "/System/Library/Fonts/Supplemental/Poppins Bold.ttf" if bold else "/System/Library/Fonts/Supplemental/Poppins Regular.ttf",
-        "C:/Windows/Fonts/Poppins-Bold.ttf" if bold else "C:/Windows/Fonts/Poppins-Regular.ttf",
-        "C:/Windows/Fonts/Poppins Bold.ttf" if bold else "C:/Windows/Fonts/Poppins Regular.ttf",
-        # Fallback fonts on Linux, macOS, and Windows.
+        str(base / f"Poppins-{suffix}.ttf"),
+        str(base / "assets" / "fonts" / f"Poppins-{suffix}.ttf"),
+        str(base / "fonts" / f"Poppins-{suffix}.ttf"),
+        f"/usr/share/fonts/truetype/poppins/Poppins-{suffix}.ttf",
+        f"/usr/local/share/fonts/Poppins-{suffix}.ttf",
+        str(Path.home() / ".fonts" / f"Poppins-{suffix}.ttf"),
+        f"/Library/Fonts/Poppins-{suffix}.ttf",
+        f"C:/Windows/Fonts/Poppins-{suffix}.ttf",
         "/usr/share/fonts/truetype/lato/Lato-Heavy.ttf" if bold else "/usr/share/fonts/truetype/lato/Lato-Regular.ttf",
         "/usr/share/fonts/truetype/lato/Lato-Black.ttf" if bold else "/usr/share/fonts/truetype/lato/Lato-Regular.ttf",
-        "/usr/share/fonts/truetype/croscore/Arimo-Bold.ttf" if bold else "/usr/share/fonts/truetype/croscore/Arimo-Regular.ttf",
         "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
@@ -396,9 +346,10 @@ def active_font_label() -> str:
     if not font_path:
         return "Pillow default fallback"
     name = Path(font_path).name
-    if name.lower().replace(" ", "-") == COVER_TITLE_FONT_NAME.lower():
-        return COVER_TITLE_FONT_NAME
-    return f"{name} fallback; add {COVER_TITLE_FONT_NAME} for exact Poppins"
+    if "poppins" in name.lower():
+        return "Poppins-Bold.ttf ✓"
+    return f"{name} (add Poppins-Bold.ttf for exact match)"
+
 
 def make_font(size: int, bold: bool = True):
     font_path = find_font(bold=bold)
@@ -412,14 +363,14 @@ def text_size(draw: ImageDraw.ImageDraw, text: str, font) -> Tuple[int, int]:
     return bbox[2] - bbox[0], bbox[3] - bbox[1]
 
 
-def wrap_text(draw: ImageDraw.ImageDraw, text: str, font, max_width: int, max_lines: int = 2) -> list[str]:
-    text = (text or "").strip()
+def wrap_lines(draw: ImageDraw.ImageDraw, text: str, font, max_width: int, max_lines: int = 2) -> list[str]:
+    text = (text or "").strip().upper()
     if not text:
         return [""]
     words = text.split()
     lines: list[str] = []
     current = ""
-    for word in words:
+    for i, word in enumerate(words):
         trial = word if not current else f"{current} {word}"
         if text_size(draw, trial, font)[0] <= max_width or not current:
             current = trial
@@ -427,108 +378,10 @@ def wrap_text(draw: ImageDraw.ImageDraw, text: str, font, max_width: int, max_li
             lines.append(current)
             current = word
             if len(lines) >= max_lines - 1:
+                current = " ".join(words[i:])
                 break
     if current:
-        remaining = " ".join(words[len(" ".join(lines).split()) :]) if lines else current
-        if lines and remaining and remaining != current:
-            current = remaining
         lines.append(current)
-    lines = lines[:max_lines]
-    # If the last line is still too wide, reduce it with an ellipsis.
-    fixed: list[str] = []
-    for line in lines:
-        if text_size(draw, line, font)[0] <= max_width:
-            fixed.append(line)
-            continue
-        clipped = line
-        while clipped and text_size(draw, clipped + "...", font)[0] > max_width:
-            clipped = clipped[:-1]
-        fixed.append((clipped.rstrip() + "...") if clipped else line[:20])
-    return fixed
-
-
-def draw_centered_lines(
-    draw: ImageDraw.ImageDraw,
-    lines: list[str],
-    font,
-    center_x: int,
-    top_y: int,
-    fill: str,
-    line_gap: int = 16,
-    shadow: bool = False,
-) -> int:
-    y = top_y
-    for line in lines:
-        w, h = text_size(draw, line, font)
-        x = center_x - w // 2
-        if shadow:
-            draw.text((x + 3, y + 4), line, font=font, fill=(0, 0, 0, 60))
-        draw.text((x, y), line, font=font, fill=fill)
-        y += h + line_gap
-    return y
-
-
-def fit_font_for_text(draw: ImageDraw.ImageDraw, text: str, max_width: int, start_size: int, min_size: int, bold: bool = True):
-    for size in range(start_size, min_size - 1, -2):
-        font = make_font(size, bold=bold)
-        if text_size(draw, text, font)[0] <= max_width:
-            return font
-    return make_font(min_size, bold=bold)
-
-
-def paste_logo_center(img: Image.Image, logo_path: Path, center_x: int, center_y: int, max_width: int, max_height: int) -> None:
-    logo = Image.open(logo_path).convert("RGBA")
-    scale = min(max_width / logo.width, max_height / logo.height, 1.0)
-    size = (max(1, int(round(logo.width * scale))), max(1, int(round(logo.height * scale))))
-    logo = logo.resize(size, Image.Resampling.LANCZOS)
-    img.alpha_composite(logo, (center_x - logo.width // 2, center_y - logo.height // 2))
-
-
-def remove_template_logo_patch(img: Image.Image) -> Image.Image:
-    """Smooth the old logo area in the template before adding the chosen brand logo."""
-    x, y, w, h = COVER_LOGO_CLEANUP_BOX
-    x = max(0, min(int(x), img.width - 1))
-    y = max(0, min(int(y), img.height - 1))
-    w = max(1, min(int(w), img.width - x))
-    h = max(1, min(int(h), img.height - y))
-
-    patch = img.crop((x, y, x + w, y + h)).filter(ImageFilter.GaussianBlur(18))
-    mask = Image.new("L", (w, h), 0)
-    mask_draw = ImageDraw.Draw(mask)
-    mask_draw.rounded_rectangle([0, 0, w, h], radius=42, fill=255)
-    mask = mask.filter(ImageFilter.GaussianBlur(10))
-    img.paste(patch, (x, y), mask)
-    return img
-
-
-def split_course_title_for_cover(draw: ImageDraw.ImageDraw, course: str, font, max_width: int, max_lines: int = 2) -> list[str]:
-    text = (course or "COURSE NAME").strip().upper()
-    if not text:
-        return ["COURSE NAME"]
-
-    words = text.split()
-    lines: list[str] = []
-    current = ""
-    word_index = 0
-
-    while word_index < len(words):
-        word = words[word_index]
-        trial = word if not current else f"{current} {word}"
-        if text_size(draw, trial, font)[0] <= max_width or not current:
-            current = trial
-            word_index += 1
-            continue
-
-        lines.append(current)
-        current = ""
-        if len(lines) >= max_lines - 1:
-            current = " ".join(words[word_index:])
-            word_index = len(words)
-            break
-
-    if current:
-        lines.append(current)
-
     lines = lines[:max_lines]
     clipped: list[str] = []
     for line in lines:
@@ -539,116 +392,185 @@ def split_course_title_for_cover(draw: ImageDraw.ImageDraw, course: str, font, m
         while value and text_size(draw, value + "...", font)[0] > max_width:
             value = value[:-1]
         clipped.append((value.rstrip() + "...") if value else line[:24])
-    return clipped or [text]
+    return clipped or [text[:24]]
 
 
-def fit_course_title_for_cover(draw: ImageDraw.ImageDraw, course: str) -> tuple[object, list[str]]:
-    for size in range(COVER_TITLE_FONT_SIZE, COVER_TITLE_MIN_FONT_SIZE - 1, -2):
+def fit_title_font(draw: ImageDraw.ImageDraw, text: str, max_width: int,
+                   start_size: int = 82, min_size: int = 36) -> tuple:
+    for size in range(start_size, min_size - 1, -2):
         font = make_font(size, bold=True)
-        lines = split_course_title_for_cover(draw, course, font, COVER_TITLE_MAX_WIDTH, max_lines=2)
-        if all(text_size(draw, line, font)[0] <= COVER_TITLE_MAX_WIDTH for line in lines):
+        lines = wrap_lines(draw, text, font, max_width, max_lines=2)
+        if all(text_size(draw, line, font)[0] <= max_width for line in lines):
             return font, lines
-    font = make_font(COVER_TITLE_MIN_FONT_SIZE, bold=True)
-    return font, split_course_title_for_cover(draw, course, font, COVER_TITLE_MAX_WIDTH, max_lines=2)
+    font = make_font(min_size, bold=True)
+    return font, wrap_lines(draw, text, font, max_width, max_lines=2)
 
 
-def draw_cover_text_with_shadow(
-    draw: ImageDraw.ImageDraw,
-    text: str,
-    font,
-    center_x: int,
-    top_y: int,
-    fill: tuple[int, int, int, int],
-) -> None:
-    w, _ = text_size(draw, text, font)
-    x = center_x - w // 2
-    # Soft purple shadow from the supplied cover page.
-    draw.text((x + 3, top_y + 5), text, font=font, fill=(72, 41, 120, 105))
-    draw.text((x, top_y), text, font=font, fill=fill)
+# -----------------------------------------------------------------------------
+# Intro frame preparation — gradient-fill erase + new text overlay
+# -----------------------------------------------------------------------------
+
+def _gradient_fill(arr: np.ndarray, y_start: int, height: int, sample_rows: int = 12) -> None:
+    """
+    Replace a horizontal band in `arr` (H×W×3 uint8) with a smooth vertical
+    gradient interpolated from the pixel rows immediately above and below it.
+    This seamlessly erases baked-in text/graphics by reconstructing the background.
+    """
+    h, w = arr.shape[:2]
+    y0 = max(0, y_start - sample_rows)
+    y1 = min(h, y_start + height + sample_rows)
+
+    above = arr[y0:y_start, :].mean(axis=0).astype(np.float32)  # (W, 3)
+    below = arr[y_start + height:y1, :].mean(axis=0).astype(np.float32)
+
+    for row in range(height):
+        if y_start + row >= h:
+            break
+        t = row / max(height - 1, 1)
+        arr[y_start + row, :] = np.clip((1 - t) * above + t * below, 0, 255).astype(np.uint8)
 
 
-def create_intro_image(
-    logo_path: Path,
-    output_png: Path,
+def prepare_intro_base_frame(brand: str) -> Optional[np.ndarray]:
+    """
+    Load the bundled intro video, extract a representative frame (t=6s
+    when all animated elements are fully visible), then erase both the
+    original title text band and the original unit pill band using
+    gradient fills. Returns a 1920×1080 RGB numpy array ready for text overlay.
+    """
+    bundled = bundled_clip_path(brand, "intro")
+    if not bundled:
+        return None
+
+    frame = extract_frame(bundled, 6.0)
+    if frame is None:
+        # Fallback to first available frame
+        frame = extract_frame(bundled, 0.0)
+    if frame is None:
+        return None
+
+    # Resize to canonical target dimensions
+    img = Image.fromarray(frame).resize((TARGET_WIDTH, TARGET_HEIGHT), Image.Resampling.LANCZOS)
+    arr = np.array(img, dtype=np.uint8).copy()
+
+    # Erase original title text region
+    _gradient_fill(arr, TITLE_ERASE_Y, TITLE_ERASE_H)
+
+    # Erase original pill + its drop shadow using side-column background sampling
+    # (avoids the pill's own halo colors contaminating the fill gradient)
+    pill_left  = arr[PILL_ERASE_Y:PILL_ERASE_Y + PILL_ERASE_H, 0:280].mean(axis=(0, 1))
+    pill_right = arr[PILL_ERASE_Y:PILL_ERASE_Y + PILL_ERASE_H, 1640:].mean(axis=(0, 1))
+    pill_bg_fill = ((pill_left + pill_right) / 2).astype(np.uint8)
+    arr[PILL_ERASE_Y:PILL_ERASE_Y + PILL_ERASE_H, :] = pill_bg_fill
+
+    return arr
+
+
+def draw_intro_overlay(
+    base_arr: np.ndarray,
     brand: str,
     course_name: str,
     unit_number: str,
     unit_name: str,
-) -> None:
+) -> Image.Image:
+    """
+    Composite the new course name + unit pill onto the gradient-erased base frame.
+    Returns a PIL RGB Image (1920×1080).
+    """
+    result = Image.fromarray(base_arr).convert("RGBA")
+    overlay = Image.new("RGBA", (TARGET_WIDTH, TARGET_HEIGHT), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay, "RGBA")
+
+    text_color = BRANDS[brand]["intro_text_color"]
+    pill_bg = BRANDS[brand]["pill_bg_color"]
+    pill_text = BRANDS[brand]["pill_text_color"]
+
     course = (course_name or "COURSE NAME").strip().upper()
     unit_no = (unit_number or "UNIT 01").strip().upper()
     unit_title = (unit_name or "CHAPTER 01").strip().upper()
-    unit_line = unit_no if not unit_title else f"{unit_no} - {unit_title}"
+    unit_line = f"{unit_no} - {unit_title}" if unit_title else unit_no
 
-    template_path = get_base() / INTRO_COVER_TEMPLATE_NAME
-    if template_path.exists():
-        img = Image.open(template_path).convert("RGBA").resize((TARGET_WIDTH, TARGET_HEIGHT), Image.Resampling.LANCZOS)
-    else:
-        # Fallback if the template image is accidentally removed.
-        img = Image.new("RGBA", (TARGET_WIDTH, TARGET_HEIGHT), "#9654DD")
+    # --- Course title ---
+    max_title_w = 1560
+    title_font, title_lines = fit_title_font(draw, course, max_title_w, start_size=82, min_size=36)
 
-    img = remove_template_logo_patch(img)
-    draw = ImageDraw.Draw(img, "RGBA")
-
-    title_font, title_lines = fit_course_title_for_cover(draw, course)
-    title_top_y = COVER_TITLE_TOP_Y
-    if len(title_lines) == 1:
-        # Keep a one-line title in the same vertical band as the supplied template.
-        title_top_y = COVER_TITLE_TOP_Y
+    lh = text_size(draw, title_lines[0], title_font)[1]
+    gap = 18
+    total_h = len(title_lines) * lh + (len(title_lines) - 1) * gap
+    title_top_y = TITLE_TEXT_CENTER_Y - total_h // 2
 
     for i, line in enumerate(title_lines):
-        draw_cover_text_with_shadow(
-            draw,
-            line,
-            title_font,
-            center_x=TARGET_WIDTH // 2,
-            top_y=title_top_y + i * COVER_TITLE_LINE_STEP,
-            fill=(255, 255, 255, 255),
-        )
+        w, h = text_size(draw, line, title_font)
+        x = TARGET_WIDTH // 2 - w // 2
+        y = title_top_y + i * (lh + gap)
+        # Subtle drop-shadow
+        draw.text((x + 3, y + 5), line, font=title_font, fill=(0, 0, 0, 55))
+        draw.text((x, y), line, font=title_font, fill=(*text_color, 255))
 
-    unit_font = fit_font_for_text(
-        draw,
-        unit_line,
-        max_width=COVER_UNIT_TEXT_MAX_WIDTH,
-        start_size=COVER_UNIT_FONT_SIZE,
-        min_size=COVER_UNIT_MIN_FONT_SIZE,
-        bold=True,
+    # --- Unit pill ---
+    unit_font = make_font(48, bold=True)
+    uw, uh = text_size(draw, unit_line, unit_font)
+    pill_w = min(max(uw + 160, PILL_MIN_W), 1060)
+    pill_h = 88
+    pill_x = TARGET_WIDTH // 2 - pill_w // 2
+    pill_y = PILL_CENTER_Y - pill_h // 2
+
+        [pill_x + 6, pill_y + 8, pill_x + pill_w + 6, pill_y + pill_h + 8],
     )
-    unit_w, unit_h = text_size(draw, unit_line, unit_font)
-    pill_w = min(max(unit_w + 150, COVER_PILL_MIN_WIDTH), COVER_PILL_MAX_WIDTH)
-    pill_h = COVER_PILL_HEIGHT
-    pill_x = (TARGET_WIDTH - pill_w) // 2
-    pill_y = COVER_PILL_Y
+    draw = ImageDraw.Draw(overlay, "RGBA")
 
-    shadow = Image.new("RGBA", img.size, (0, 0, 0, 0))
-    shadow_draw = ImageDraw.Draw(shadow)
-    shadow_draw.rounded_rectangle(
-        [pill_x + 8, pill_y + 10, pill_x + pill_w + 8, pill_y + pill_h + 10],
-        radius=50,
-        fill=(55, 20, 95, 95),
+    draw.rounded_rectangle(
+        [pill_x, pill_y, pill_x + pill_w, pill_y + pill_h],
+        radius=44, fill=(*pill_bg, 255),
     )
-    shadow = shadow.filter(ImageFilter.GaussianBlur(9))
-    img.alpha_composite(shadow)
-
-    draw = ImageDraw.Draw(img, "RGBA")
-    draw.rounded_rectangle([pill_x, pill_y, pill_x + pill_w, pill_y + pill_h], radius=50, fill=(255, 255, 255, 255))
-    draw.rounded_rectangle([pill_x, pill_y, pill_x + pill_w, pill_y + pill_h], radius=50, outline=(220, 193, 246, 255), width=7)
+    draw.rounded_rectangle(
+        [pill_x, pill_y, pill_x + pill_w, pill_y + pill_h],
+        radius=44, outline=(*pill_text, 90), width=5,
+    )
     draw.text(
-        (TARGET_WIDTH // 2 - unit_w // 2, pill_y + (pill_h - unit_h) // 2 - 8),
-        unit_line,
-        font=unit_font,
-        fill=(91, 43, 130, 255),
+        (TARGET_WIDTH // 2 - uw // 2, pill_y + (pill_h - uh) // 2 - 4),
+        unit_line, font=unit_font, fill=(*pill_text, 255),
     )
 
-    if logo_path and logo_path.exists():
-        logo_center_x, logo_center_y = COVER_LOGO_CENTER
-        logo_max_w, logo_max_h = COVER_LOGO_MAX_SIZE
-        paste_logo_center(img, logo_path, logo_center_x, logo_center_y, max_width=logo_max_w, max_height=logo_max_h)
+    final = Image.alpha_composite(result, overlay)
+    return final.convert("RGB")
 
-    img.convert("RGB").save(output_png, quality=95)
 
-def create_dynamic_intro_clip(
-    logo_path: Path,
+def build_intro_frame_image(
+    brand: str,
+    course_name: str,
+    unit_number: str,
+    unit_name: str,
+    output_png: Path,
+) -> None:
+    """Build and save a 1920×1080 PNG suitable for ffmpeg -loop 1 input."""
+    base_arr = prepare_intro_base_frame(brand)
+    if base_arr is None:
+        raise FileNotFoundError(
+            f"Could not extract frame from {BRANDS[brand]['prefix']}_intro.mp4. "
+            "Make sure the file is beside app.py."
+        )
+    img = draw_intro_overlay(base_arr, brand, course_name, unit_number, unit_name)
+    img.save(output_png, quality=95)
+
+
+def preview_intro_frame(
+    brand: str,
+    course_name: str,
+    unit_number: str,
+    unit_name: str,
+) -> Optional[Image.Image]:
+    """Return a preview PIL image of the intro with the new course name applied."""
+    base_arr = prepare_intro_base_frame(brand)
+    if base_arr is None:
+        return None
+    return draw_intro_overlay(base_arr, brand, course_name, unit_number, unit_name)
+
+
+# -----------------------------------------------------------------------------
+# Intro video generation — uses real intro MP4 with frame-by-frame overlay
+# -----------------------------------------------------------------------------
+
+def create_intro_clip_with_overlay(
     output_path: Path,
     brand: str,
     course_name: str,
@@ -657,57 +579,147 @@ def create_dynamic_intro_clip(
     speed_mode: str = DEFAULT_SPEED_MODE,
     crf: Optional[int] = None,
 ) -> None:
-    png_path = output_path.with_suffix(".png")
-    create_intro_image(logo_path, png_path, brand, course_name, unit_number, unit_name)
-    fade_out_start = max(INTRO_DURATION - 0.45, 0.1)
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-hide_banner",
-        "-loop",
-        "1",
-        "-framerate",
-        str(TARGET_FPS),
-        "-t",
-        f"{INTRO_DURATION:.3f}",
-        "-i",
-        str(png_path),
-        "-f",
-        "lavfi",
-        "-t",
-        f"{INTRO_DURATION:.3f}",
-        "-i",
-        f"anullsrc=channel_layout=stereo:sample_rate={AUDIO_RATE}",
-        "-vf",
-        f"fps={TARGET_FPS},fade=t=in:st=0:d=0.35,fade=t=out:st={fade_out_start:.3f}:d=0.45,format=yuv420p",
-        "-map",
-        "0:v:0",
-        "-map",
-        "1:a:0",
-        *video_encoding_args(speed_mode, crf),
-        "-c:a",
-        "aac",
-        "-b:a",
-        "192k",
-        "-ar",
-        str(AUDIO_RATE),
-        "-ac",
-        "2",
-        "-movflags",
-        "+faststart",
-        "-shortest",
-        str(output_path),
-    ]
+    """
+    Strategy:
+      1. Extract the bundled intro video frame-by-frame.
+      2. On every frame: gradient-fill the title and pill bands, then draw new text.
+      3. Re-encode to MP4 with the original audio preserved.
+
+    This preserves all animations (3D objects, dots, logo) while replacing
+    only the baked-in course name and unit pill with the user's input.
+    """
+    bundled = bundled_clip_path(brand, "intro")
+    if not bundled:
+        raise FileNotFoundError(
+            f"{BRANDS[brand]['prefix']}_intro.mp4 not found beside app.py."
+        )
+
+    info = get_media_info(bundled)
+    duration = info.duration
+
+    # Pre-render the overlay PNG once (same overlay applied to every frame)
+    overlay_png = output_path.with_suffix(".overlay.png")
     try:
-        run_cmd(cmd, "Generate dynamic intro")
+        # Build overlay-only image (transparent PNG with new text)
+        overlay_img = Image.new("RGBA", (TARGET_WIDTH, TARGET_HEIGHT), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(overlay_img, "RGBA")
+
+        text_color = BRANDS[brand]["intro_text_color"]
+        pill_bg_c = BRANDS[brand]["pill_bg_color"]
+        pill_text_c = BRANDS[brand]["pill_text_color"]
+
+        course = (course_name or "COURSE NAME").strip().upper()
+        unit_no = (unit_number or "UNIT 01").strip().upper()
+        unit_title = (unit_name or "CHAPTER 01").strip().upper()
+        unit_line = f"{unit_no} - {unit_title}" if unit_title else unit_no
+
+        max_title_w = 1560
+        title_font, title_lines = fit_title_font(draw, course, max_title_w, start_size=82, min_size=36)
+        lh = text_size(draw, title_lines[0], title_font)[1]
+        gap = 18
+        total_h = len(title_lines) * lh + (len(title_lines) - 1) * gap
+        title_top_y = TITLE_TEXT_CENTER_Y - total_h // 2
+
+        for i, line in enumerate(title_lines):
+            w, h = text_size(draw, line, title_font)
+            x = TARGET_WIDTH // 2 - w // 2
+            y = title_top_y + i * (lh + gap)
+            draw.text((x + 3, y + 5), line, font=title_font, fill=(0, 0, 0, 55))
+            draw.text((x, y), line, font=title_font, fill=(*text_color, 255))
+
+        unit_font = make_font(48, bold=True)
+        uw, uh = text_size(draw, unit_line, unit_font)
+        pill_w = min(max(uw + 160, PILL_MIN_W), 1060)
+        pill_h = 88
+        pill_x = TARGET_WIDTH // 2 - pill_w // 2
+        pill_y = PILL_CENTER_Y - pill_h // 2
+
+        shadow_img = Image.new("RGBA", (TARGET_WIDTH, TARGET_HEIGHT), (0, 0, 0, 0))
+        sdraw = ImageDraw.Draw(shadow_img)
+        sdraw.rounded_rectangle(
+            [pill_x + 6, pill_y + 8, pill_x + pill_w + 6, pill_y + pill_h + 8],
+            radius=44, fill=(30, 10, 60, 75),
+        )
+        shadow_img = shadow_img.filter(ImageFilter.GaussianBlur(7))
+        overlay_img = Image.alpha_composite(overlay_img, shadow_img)
+        draw = ImageDraw.Draw(overlay_img, "RGBA")
+
+        draw.rounded_rectangle([pill_x, pill_y, pill_x + pill_w, pill_y + pill_h], radius=44, fill=(*pill_bg_c, 255))
+        draw.rounded_rectangle([pill_x, pill_y, pill_x + pill_w, pill_y + pill_h], radius=44, outline=(*pill_text_c, 90), width=5)
+        draw.text((TARGET_WIDTH // 2 - uw // 2, pill_y + (pill_h - uh) // 2 - 4), unit_line, font=unit_font, fill=(*pill_text_c, 255))
+        overlay_img.save(overlay_png)
+
+        # Use FFmpeg to:
+        # [0] intro video → scale to 1920×1080, erase title band, erase pill band with drawbox
+        # [1] overlay PNG (looped) → alpha composite on top
+        # This is the most efficient approach (no per-frame Python loop needed).
+        #
+        # For erasing: we use two drawbox filters with the average color of the
+        # surrounding pixels (pre-computed from the static frame).
+        base_arr = prepare_intro_base_frame(brand)
+        if base_arr is None:
+            raise RuntimeError("Could not prepare intro base frame for color sampling.")
+
+        # Sample gradient fill colors for title band
+        title_above = base_arr[max(0, TITLE_ERASE_Y - 12):TITLE_ERASE_Y, :].mean(axis=(0, 1))
+        title_below_y = TITLE_ERASE_Y + TITLE_ERASE_H
+        title_below = base_arr[title_below_y:title_below_y + 12, :].mean(axis=(0, 1))
+        title_mid = ((title_above + title_below) / 2).astype(int)
+        title_color_hex = f"0x{title_mid[0]:02X}{title_mid[1]:02X}{title_mid[2]:02X}@1.0"
+
+        # Sample gradient fill colors for pill band
+        pill_above = base_arr[max(0, PILL_ERASE_Y - 12):PILL_ERASE_Y, :].mean(axis=(0, 1))
+        pill_below_y = PILL_ERASE_Y + PILL_ERASE_H
+        pill_below = base_arr[pill_below_y:pill_below_y + 12, :].mean(axis=(0, 1))
+        pill_mid = ((pill_above + pill_below) / 2).astype(int)
+        pill_color_hex = f"0x{pill_mid[0]:02X}{pill_mid[1]:02X}{pill_mid[2]:02X}@1.0"
+
+        vf = (
+            f"scale={TARGET_WIDTH}:{TARGET_HEIGHT}:force_original_aspect_ratio=decrease,"
+            f"pad={TARGET_WIDTH}:{TARGET_HEIGHT}:(ow-iw)/2:(oh-ih)/2,setsar=1,"
+            f"fps={TARGET_FPS},"
+            # Erase original title band
+            f"drawbox=x=0:y={TITLE_ERASE_Y}:w={TARGET_WIDTH}:h={TITLE_ERASE_H}:color={title_color_hex}:t=fill,"
+            # Erase original pill band
+            f"drawbox=x=0:y={PILL_ERASE_Y}:w={TARGET_WIDTH}:h={PILL_ERASE_H}:color={pill_color_hex}:t=fill,"
+            f"format=rgba[base];"
+            f"[1:v]format=rgba[ov];"
+            f"[base][ov]overlay=0:0:format=auto,format=yuv420p[v]"
+        )
+
+        cmd = [
+            "ffmpeg", "-y", "-hide_banner",
+            "-i", str(bundled),
+            "-loop", "1", "-i", str(overlay_png),
+            "-filter_complex", vf,
+            "-map", "[v]",
+        ]
+
+        if info.has_audio:
+            cmd += ["-map", "0:a:0"]
+        else:
+            cmd += [
+                "-f", "lavfi", "-t", f"{duration:.3f}",
+                "-i", f"anullsrc=channel_layout=stereo:sample_rate={AUDIO_RATE}",
+                "-map", "2:a:0",
+            ]
+
+        cmd += [
+            *video_encoding_args(speed_mode, crf),
+            "-c:a", "aac", "-b:a", "192k", "-ar", str(AUDIO_RATE), "-ac", "2",
+            "-movflags", "+faststart",
+            "-t", f"{duration:.3f}",
+            str(output_path),
+        ]
+
+        run_cmd(cmd, "Generate intro clip with course name overlay")
     finally:
-        png_path.unlink(missing_ok=True)
+        overlay_png.unlink(missing_ok=True)
 
 
 # -----------------------------------------------------------------------------
-# FFmpeg processing helpers
+# FFmpeg processing helpers — content video and concat
 # -----------------------------------------------------------------------------
-
 
 def video_scale_filter(target_w: int = TARGET_WIDTH, target_h: int = TARGET_HEIGHT, fps: int = TARGET_FPS) -> str:
     return (
@@ -727,7 +739,6 @@ def process_content_segment(
     speed_mode: str = DEFAULT_SPEED_MODE,
     crf: Optional[int] = None,
 ) -> None:
-    """Cut source, hard-hide the exact rendered SLC logo, then add the brand logo in the same footprint."""
     duration = float(trim_end) - float(trim_start)
     if duration <= 0:
         raise ValueError("Trim settings leave no content. Reduce intro/outro removal.")
@@ -736,7 +747,6 @@ def process_content_segment(
 
     x, y, w, h = FIXED_SLC_LOGO_BOX
     cover = ffmpeg_color_from_hex(FIXED_SLC_COVER_COLOR, 1.0)
-
     cover_x = max(0, x - FIXED_SLC_COVER_BLEED)
     cover_y = max(0, y - FIXED_SLC_COVER_BLEED)
     cover_w = min(TARGET_WIDTH - cover_x, w + (x - cover_x) + FIXED_SLC_COVER_BLEED)
@@ -751,71 +761,31 @@ def process_content_segment(
     )
 
     cmd = [
-        "ffmpeg",
-        "-y",
-        "-hide_banner",
+        "ffmpeg", "-y", "-hide_banner",
         "-accurate_seek",
-        "-ss",
-        f"{float(trim_start):.3f}",
-        "-t",
-        f"{duration:.3f}",
-        "-i",
-        str(source_path),
-        "-loop",
-        "1",
-        "-i",
-        str(brand_logo),
+        "-ss", f"{float(trim_start):.3f}",
+        "-t", f"{duration:.3f}",
+        "-i", str(source_path),
+        "-loop", "1", "-i", str(brand_logo),
     ]
 
     if media.has_audio:
         cmd += [
-            "-filter_complex",
-            filter_complex,
-            "-map",
-            "[v]",
-            "-map",
-            "0:a:0",
+            "-filter_complex", filter_complex,
+            "-map", "[v]", "-map", "0:a:0",
             *video_encoding_args(speed_mode, crf),
-            "-c:a",
-            "aac",
-            "-b:a",
-            "192k",
-            "-ar",
-            str(AUDIO_RATE),
-            "-ac",
-            "2",
-            "-movflags",
-            "+faststart",
-            "-shortest",
-            str(output_path),
+            "-c:a", "aac", "-b:a", "192k", "-ar", str(AUDIO_RATE), "-ac", "2",
+            "-movflags", "+faststart", "-shortest", str(output_path),
         ]
     else:
         cmd += [
-            "-f",
-            "lavfi",
-            "-t",
-            f"{duration:.3f}",
-            "-i",
-            f"anullsrc=channel_layout=stereo:sample_rate={AUDIO_RATE}",
-            "-filter_complex",
-            filter_complex,
-            "-map",
-            "[v]",
-            "-map",
-            "2:a:0",
+            "-f", "lavfi", "-t", f"{duration:.3f}",
+            "-i", f"anullsrc=channel_layout=stereo:sample_rate={AUDIO_RATE}",
+            "-filter_complex", filter_complex,
+            "-map", "[v]", "-map", "2:a:0",
             *video_encoding_args(speed_mode, crf),
-            "-c:a",
-            "aac",
-            "-b:a",
-            "192k",
-            "-ar",
-            str(AUDIO_RATE),
-            "-ac",
-            "2",
-            "-movflags",
-            "+faststart",
-            "-shortest",
-            str(output_path),
+            "-c:a", "aac", "-b:a", "192k", "-ar", str(AUDIO_RATE), "-ac", "2",
+            "-movflags", "+faststart", "-shortest", str(output_path),
         ]
 
     run_cmd(cmd, "Cut content, remove SLC logo, add brand logo")
@@ -825,128 +795,52 @@ def normalize_clip(input_path: Path, output_path: Path, speed_mode: str = DEFAUL
     info = get_media_info(input_path)
     if not info.has_video:
         raise ValueError(f"No video stream found in {input_path.name}")
-
     filter_complex = f"[0:v]{video_scale_filter()},format=yuv420p[v]"
     if info.has_audio:
         cmd = [
-            "ffmpeg",
-            "-y",
-            "-hide_banner",
-            "-i",
-            str(input_path),
-            "-filter_complex",
-            filter_complex,
-            "-map",
-            "[v]",
-            "-map",
-            "0:a:0",
+            "ffmpeg", "-y", "-hide_banner", "-i", str(input_path),
+            "-filter_complex", filter_complex,
+            "-map", "[v]", "-map", "0:a:0",
             *video_encoding_args(speed_mode, crf),
-            "-c:a",
-            "aac",
-            "-b:a",
-            "192k",
-            "-ar",
-            str(AUDIO_RATE),
-            "-ac",
-            "2",
-            "-movflags",
-            "+faststart",
-            "-shortest",
-            str(output_path),
+            "-c:a", "aac", "-b:a", "192k", "-ar", str(AUDIO_RATE), "-ac", "2",
+            "-movflags", "+faststart", "-shortest", str(output_path),
         ]
     else:
         duration = max(info.duration, 0.1)
         cmd = [
-            "ffmpeg",
-            "-y",
-            "-hide_banner",
-            "-i",
-            str(input_path),
-            "-f",
-            "lavfi",
-            "-t",
-            f"{duration:.3f}",
-            "-i",
-            f"anullsrc=channel_layout=stereo:sample_rate={AUDIO_RATE}",
-            "-filter_complex",
-            filter_complex,
-            "-map",
-            "[v]",
-            "-map",
-            "1:a:0",
+            "ffmpeg", "-y", "-hide_banner", "-i", str(input_path),
+            "-f", "lavfi", "-t", f"{duration:.3f}",
+            "-i", f"anullsrc=channel_layout=stereo:sample_rate={AUDIO_RATE}",
+            "-filter_complex", filter_complex,
+            "-map", "[v]", "-map", "1:a:0",
             *video_encoding_args(speed_mode, crf),
-            "-c:a",
-            "aac",
-            "-b:a",
-            "192k",
-            "-ar",
-            str(AUDIO_RATE),
-            "-ac",
-            "2",
-            "-movflags",
-            "+faststart",
-            "-shortest",
-            str(output_path),
+            "-c:a", "aac", "-b:a", "192k", "-ar", str(AUDIO_RATE), "-ac", "2",
+            "-movflags", "+faststart", "-shortest", str(output_path),
         ]
-
     run_cmd(cmd, f"Normalize {input_path.name}")
 
 
 def create_logo_slate(
-    logo_path: Path,
-    output_path: Path,
-    brand: str,
-    duration: float = 3.0,
-    logo_width_px: int = 620,
-    speed_mode: str = DEFAULT_SPEED_MODE,
-    crf: Optional[int] = None,
+    logo_path: Path, output_path: Path, brand: str, duration: float = 3.0,
+    logo_width_px: int = 620, speed_mode: str = DEFAULT_SPEED_MODE, crf: Optional[int] = None,
 ) -> None:
     bg = BRANDS[brand]["bg"]
     duration = max(float(duration), 0.5)
     cmd = [
-        "ffmpeg",
-        "-y",
-        "-hide_banner",
-        "-f",
-        "lavfi",
-        "-t",
-        f"{duration:.3f}",
-        "-i",
-        f"color=c={bg}:s={TARGET_WIDTH}x{TARGET_HEIGHT}:r={TARGET_FPS}",
-        "-loop",
-        "1",
-        "-t",
-        f"{duration:.3f}",
-        "-i",
-        str(logo_path),
-        "-f",
-        "lavfi",
-        "-t",
-        f"{duration:.3f}",
-        "-i",
-        f"anullsrc=channel_layout=stereo:sample_rate={AUDIO_RATE}",
-        "-filter_complex",
-        (
+        "ffmpeg", "-y", "-hide_banner",
+        "-f", "lavfi", "-t", f"{duration:.3f}",
+        "-i", f"color=c={bg}:s={TARGET_WIDTH}x{TARGET_HEIGHT}:r={TARGET_FPS}",
+        "-loop", "1", "-t", f"{duration:.3f}", "-i", str(logo_path),
+        "-f", "lavfi", "-t", f"{duration:.3f}",
+        "-i", f"anullsrc=channel_layout=stereo:sample_rate={AUDIO_RATE}",
+        "-filter_complex", (
             f"[1:v]format=rgba,scale={logo_width_px}:-1[logo];"
             f"[0:v][logo]overlay=x=(W-w)/2:y=(H-h)/2:format=auto,format=yuv420p[v]"
         ),
-        "-map",
-        "[v]",
-        "-map",
-        "2:a:0",
+        "-map", "[v]", "-map", "2:a:0",
         *video_encoding_args(speed_mode, crf),
-        "-c:a",
-        "aac",
-        "-b:a",
-        "192k",
-        "-ar",
-        str(AUDIO_RATE),
-        "-ac",
-        "2",
-        "-movflags",
-        "+faststart",
-        "-shortest",
-        str(output_path),
+        "-c:a", "aac", "-b:a", "192k", "-ar", str(AUDIO_RATE), "-ac", "2",
+        "-movflags", "+faststart", "-shortest", str(output_path),
     ]
     run_cmd(cmd, f"Generate {brand} logo slate")
 
@@ -963,7 +857,8 @@ def prepare_outro_clip(brand: str, logo_path: Path, tmpdir: Path, speed_mode: st
     return norm
 
 
-def concat_three_clips(intro: Path, content: Path, outro: Path, output: Path, speed_mode: str = DEFAULT_SPEED_MODE, crf: Optional[int] = None) -> None:
+def concat_three_clips(intro: Path, content: Path, outro: Path, output: Path,
+                       speed_mode: str = DEFAULT_SPEED_MODE, crf: Optional[int] = None) -> None:
     concat_file = output.with_suffix(".concat.txt")
     concat_file.write_text(
         f"file '{intro.as_posix()}'\n"
@@ -971,57 +866,23 @@ def concat_three_clips(intro: Path, content: Path, outro: Path, output: Path, sp
         f"file '{outro.as_posix()}'\n",
         encoding="utf-8",
     )
-
     copy_cmd = [
-        "ffmpeg",
-        "-y",
-        "-hide_banner",
-        "-f",
-        "concat",
-        "-safe",
-        "0",
-        "-i",
-        str(concat_file),
-        "-c",
-        "copy",
-        "-movflags",
-        "+faststart",
-        str(output),
+        "ffmpeg", "-y", "-hide_banner",
+        "-f", "concat", "-safe", "0", "-i", str(concat_file),
+        "-c", "copy", "-movflags", "+faststart", str(output),
     ]
-
     result = subprocess.run(prepare_ffmpeg_cmd(copy_cmd), capture_output=True, text=True)
     if result.returncode == 0:
         concat_file.unlink(missing_ok=True)
         return
-
     fallback_cmd = [
-        "ffmpeg",
-        "-y",
-        "-hide_banner",
-        "-i",
-        str(intro),
-        "-i",
-        str(content),
-        "-i",
-        str(outro),
-        "-filter_complex",
-        "[0:v][0:a][1:v][1:a][2:v][2:a]concat=n=3:v=1:a=1[v][a]",
-        "-map",
-        "[v]",
-        "-map",
-        "[a]",
+        "ffmpeg", "-y", "-hide_banner",
+        "-i", str(intro), "-i", str(content), "-i", str(outro),
+        "-filter_complex", "[0:v][0:a][1:v][1:a][2:v][2:a]concat=n=3:v=1:a=1[v][a]",
+        "-map", "[v]", "-map", "[a]",
         *video_encoding_args(speed_mode, crf),
-        "-c:a",
-        "aac",
-        "-b:a",
-        "192k",
-        "-ar",
-        str(AUDIO_RATE),
-        "-ac",
-        "2",
-        "-movflags",
-        "+faststart",
-        str(output),
+        "-c:a", "aac", "-b:a", "192k", "-ar", str(AUDIO_RATE), "-ac", "2",
+        "-movflags", "+faststart", str(output),
     ]
     try:
         run_cmd(fallback_cmd, "Final concat")
@@ -1032,7 +893,6 @@ def concat_three_clips(intro: Path, content: Path, outro: Path, output: Path, sp
 # -----------------------------------------------------------------------------
 # Processing orchestration
 # -----------------------------------------------------------------------------
-
 
 def process_one_video(
     uploaded_file,
@@ -1064,8 +924,7 @@ def process_one_video(
         )
 
     intro_path = tmpdir / f"intro_{index}.mp4"
-    create_dynamic_intro_clip(
-        logo_path=logo_path,
+    create_intro_clip_with_overlay(
         output_path=intro_path,
         brand=brand,
         course_name=course_name,
@@ -1092,11 +951,9 @@ def process_one_video(
     return final_path
 
 
-
 # -----------------------------------------------------------------------------
-# Streamlit UI and queue helpers
+# Streamlit UI helpers
 # -----------------------------------------------------------------------------
-
 
 @dataclass
 class QueuedUploadedFile:
@@ -1109,8 +966,7 @@ class QueuedUploadedFile:
 
 def setup_style() -> None:
     st.set_page_config(page_title="Video Rebranding Queue", page_icon="🎬", layout="wide")
-    st.markdown(
-        """
+    st.markdown("""
 <style>
 .block-container {max-width: 1220px; padding-top: 1.4rem; padding-bottom: 2rem;}
 .hero {padding: 22px 26px; border-radius: 18px; background: linear-gradient(135deg, #15243F 0%, #1A5D82 100%); color: white; margin-bottom: 16px;}
@@ -1124,11 +980,7 @@ def setup_style() -> None:
 .muted {color:#64748B; font-size: 0.92rem;}
 .fixed-logo-note {background:#EAF4FB; border-left: 4px solid #1565C0; padding: 11px 13px; border-radius: 10px; color:#16324F;}
 .queue-tip {background:#F8FAFC; border:1px solid #E2E8F0; padding: 12px 14px; border-radius: 12px;}
-hr {margin-top: 1.1rem; margin-bottom: 1.1rem;}
-</style>
-""",
-        unsafe_allow_html=True,
-    )
+</style>""", unsafe_allow_html=True)
 
 
 def init_queue_state() -> None:
@@ -1152,12 +1004,7 @@ def make_job_id(filename: str, data: bytes) -> str:
 
 def status_badge(status: str) -> str:
     key = (status or "Queued").lower()
-    css = {
-        "queued": "badge-queued",
-        "processing": "badge-processing",
-        "done": "badge-done",
-        "failed": "badge-failed",
-    }.get(key, "badge-queued")
+    css = {"queued": "badge-queued", "processing": "badge-processing", "done": "badge-done", "failed": "badge-failed"}.get(key, "badge-queued")
     return f'<span class="badge {css}">{status}</span>'
 
 
@@ -1217,7 +1064,6 @@ def add_uploads_to_queue(uploaded_videos, brand: str, default_course: str, defau
     added = 0
     skipped = 0
     start_index = len(st.session_state.queue_jobs) + 1
-
     for offset, uploaded in enumerate(uploaded_videos or []):
         data = uploaded.getvalue()
         job_id = make_job_id(uploaded.name, data)
@@ -1227,23 +1073,21 @@ def add_uploads_to_queue(uploaded_videos, brand: str, default_course: str, defau
         stem = Path(uploaded.name).stem
         unit_number = f"UNIT {start_index + added:02d}"
         output_name = safe_output_name(f"{stem}_{brand.lower()}_rebranded.mp4", stem, brand)
-        st.session_state.queue_jobs.append(
-            {
-                "job_id": job_id,
-                "name": uploaded.name,
-                "data": data,
-                "size_label": f"{len(data) / 1_048_576:.1f} MB",
-                "course_name": default_course.strip() or "LEVEL 4 DIPLOMA IN EDUCATION STUDIES (RQF)",
-                "unit_number": unit_number,
-                "unit_name": default_unit_name.strip() or "CHAPTER 01",
-                "output_name": output_name,
-                "status": "Queued",
-                "error": "",
-                "output_path": "",
-                "duration_label": "",
-                "output_size_label": "",
-            }
-        )
+        st.session_state.queue_jobs.append({
+            "job_id": job_id,
+            "name": uploaded.name,
+            "data": data,
+            "size_label": f"{len(data) / 1_048_576:.1f} MB",
+            "course_name": default_course.strip() or "COURSE NAME",
+            "unit_number": unit_number,
+            "unit_name": default_unit_name.strip() or "CHAPTER 01",
+            "output_name": output_name,
+            "status": "Queued",
+            "error": "",
+            "output_path": "",
+            "duration_label": "",
+            "output_size_label": "",
+        })
         existing.add(job_id)
         added += 1
     return added, skipped
@@ -1262,17 +1106,15 @@ def queue_counts() -> dict[str, int]:
 def make_queue_rows() -> list[dict]:
     rows = []
     for i, job in enumerate(st.session_state.queue_jobs, start=1):
-        rows.append(
-            {
-                "#": i,
-                "Video": job.get("name", ""),
-                "Unit": job.get("unit_number", ""),
-                "Chapter / unit name": job.get("unit_name", ""),
-                "Status": job.get("status", "Queued"),
-                "Input size": job.get("size_label", ""),
-                "Output": Path(job.get("output_name", "")).name,
-            }
-        )
+        rows.append({
+            "#": i,
+            "Video": job.get("name", ""),
+            "Unit": job.get("unit_number", ""),
+            "Chapter / unit name": job.get("unit_name", ""),
+            "Status": job.get("status", "Queued"),
+            "Input size": job.get("size_label", ""),
+            "Output": Path(job.get("output_name", "")).name,
+        })
     return rows
 
 
@@ -1300,12 +1142,12 @@ def build_completed_zip(brand: str) -> bytes:
                 continue
             arcname = safe_output_name(job.get("output_name", output_path.name), output_path.stem, brand)
             if arcname in used_names:
-                stem = Path(arcname).stem
-                suffix = Path(arcname).suffix or ".mp4"
+                stem_p = Path(arcname).stem
+                suffix_p = Path(arcname).suffix or ".mp4"
                 counter = 2
-                while f"{stem}_{counter}{suffix}" in used_names:
+                while f"{stem_p}_{counter}{suffix_p}" in used_names:
                     counter += 1
-                arcname = f"{stem}_{counter}{suffix}"
+                arcname = f"{stem_p}_{counter}{suffix_p}"
             used_names.add(arcname)
             zf.write(output_path, arcname=arcname)
     return buffer.getvalue()
@@ -1313,21 +1155,16 @@ def build_completed_zip(brand: str) -> bytes:
 
 def guess_google_drive_folder() -> str:
     candidates = [
-        Path.home() / "Google Drive",
-        Path.home() / "GoogleDrive",
-        Path.home() / "My Drive",
-        Path.home() / "Google Drive" / "My Drive",
-        Path("/content/drive/MyDrive"),
-        Path("/mnt/drive/MyDrive"),
-        Path("G:/My Drive"),
-        Path("G:/Google Drive"),
+        Path.home() / "Google Drive", Path.home() / "GoogleDrive",
+        Path.home() / "My Drive", Path("/content/drive/MyDrive"),
+        Path("/mnt/drive/MyDrive"), Path("G:/My Drive"),
     ]
     for candidate in candidates:
         try:
             if candidate.exists() and candidate.is_dir():
                 return str(candidate)
         except Exception:
-            continue
+            pass
     return ""
 
 
@@ -1335,9 +1172,7 @@ def safe_zip_name(value: str, fallback_stem: str = "completed_rebranded_videos")
     raw = (value or "").strip() or f"{fallback_stem}.zip"
     raw = raw.replace("\\", "_").replace("/", "_").strip()
     raw = re.sub(r"[^A-Za-z0-9._ -]+", "_", raw)
-    raw = re.sub(r"\s+", " ", raw).strip(" ._")
-    if not raw:
-        raw = f"{fallback_stem}.zip"
+    raw = re.sub(r"\s+", " ", raw).strip(" ._") or f"{fallback_stem}.zip"
     if raw.lower().endswith(".mp4"):
         raw = raw[:-4]
     if not raw.lower().endswith(".zip"):
@@ -1381,26 +1216,6 @@ def get_first_queued_video_preview(trim_start: float) -> Optional[Image.Image]:
             preview_path.unlink(missing_ok=True)
 
 
-def create_intro_cover_preview_image(
-    logo_path: Path,
-    brand: str,
-    course_name: str,
-    unit_number: str,
-    unit_name: str,
-) -> Optional[Image.Image]:
-    preview_path: Optional[Path] = None
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp_file:
-            preview_path = Path(tmp_file.name)
-        create_intro_image(logo_path, preview_path, brand, course_name, unit_number, unit_name)
-        return Image.open(preview_path).convert("RGB").copy()
-    except Exception:
-        return None
-    finally:
-        if preview_path is not None:
-            preview_path.unlink(missing_ok=True)
-
-
 def update_queue_table(slot) -> None:
     rows = make_queue_rows()
     if rows:
@@ -1409,13 +1224,7 @@ def update_queue_table(slot) -> None:
         slot.info("Queue is empty.")
 
 
-def process_queue(
-    brand: str,
-    logo_path: Path,
-    trim_start: float,
-    outro_remove: float,
-    speed_mode: str,
-) -> None:
+def process_queue(brand: str, logo_path: Path, trim_start: float, outro_remove: float, speed_mode: str) -> None:
     pending = [job for job in st.session_state.queue_jobs if job.get("status") in {"Queued", "Failed"}]
     if not pending:
         st.info("Nothing queued. Add videos or requeue completed items first.")
@@ -1423,8 +1232,7 @@ def process_queue(
 
     status_slot = st.empty()
     table_slot = st.empty()
-    progress_slot = st.empty()
-    progress_bar = progress_slot.progress(0)
+    progress_bar = st.empty().progress(0)
 
     def show(message: str, pct: int) -> None:
         status_slot.info(message)
@@ -1460,7 +1268,6 @@ def process_queue(
                     index=idx,
                     speed_mode=speed_mode,
                 )
-
                 final_disk_path = output_dir() / f"{job.get('job_id')}_{output_name}"
                 shutil.copy(result_path, final_disk_path)
                 info = get_media_info(final_disk_path)
@@ -1477,10 +1284,14 @@ def process_queue(
     show("Queue finished.", 100)
     counts = queue_counts()
     if counts.get("Failed", 0):
-        st.warning(f"Queue finished with {counts['Failed']} failed item(s). Open the failed item to see the error and retry.")
+        st.warning(f"Queue finished with {counts['Failed']} failed item(s). Open the failed item for details.")
     else:
         st.success("Queue complete. All videos were processed.")
 
+
+# -----------------------------------------------------------------------------
+# Main UI
+# -----------------------------------------------------------------------------
 
 def main() -> None:
     setup_style()
@@ -1492,15 +1303,11 @@ def main() -> None:
         st.error(str(ex))
         st.stop()
 
-    st.markdown(
-        """
+    st.markdown("""
 <div class="hero">
-  <h1>Video Rebranding Queue</h1>
-  <p>Upload many SLC videos, edit intro text per video, then process the queue one by one.</p>
-</div>
-""",
-        unsafe_allow_html=True,
-    )
+  <h1>🎬 Video Rebranding Queue</h1>
+  <p>Upload SLC videos → set course name per video → process. Uses the real intro video with your course name overlaid.</p>
+</div>""", unsafe_allow_html=True)
 
     with st.sidebar:
         st.header("Global settings")
@@ -1509,121 +1316,98 @@ def main() -> None:
         if logo_path:
             try:
                 logo_img = Image.open(logo_path).convert("RGBA")
-                bg = Image.new("RGB", logo_img.size, (255, 255, 255))
+                bg_img = Image.new("RGB", logo_img.size, (255, 255, 255))
                 alpha = logo_img.split()[3] if len(logo_img.split()) == 4 else None
-                bg.paste(logo_img, mask=alpha)
-                st.image(bg, width=165)
+                bg_img.paste(logo_img, mask=alpha)
+                st.image(bg_img, width=165)
             except Exception:
                 st.caption(logo_path.name)
         else:
-            st.error(f"Missing logo file for {brand}.")
+            st.error(f"Missing logo for {brand}.")
+
+        intro_clip = bundled_clip_path(brand, "intro")
+        if intro_clip:
+            st.success(f"✓ {intro_clip.name}")
+        else:
+            st.error(f"Missing {BRANDS[brand]['prefix']}_intro.mp4 beside app.py")
 
         st.divider()
-        speed_mode = st.selectbox("Processing speed", list(SPEED_PROFILES.keys()), index=list(SPEED_PROFILES.keys()).index(DEFAULT_SPEED_MODE))
+        speed_mode = st.selectbox(
+            "Processing speed", list(SPEED_PROFILES.keys()),
+            index=list(SPEED_PROFILES.keys()).index(DEFAULT_SPEED_MODE),
+        )
         st.caption(get_speed_profile(speed_mode)["note"])
 
         st.divider()
-        trim_start = st.number_input(
-            "Remove SLC intro from start",
-            min_value=0.0,
-            max_value=300.0,
-            value=9.0,
-            step=0.1,
-            format="%.1f",
-            help="Seconds removed from the beginning of every queued video.",
-        )
-        outro_remove = st.number_input(
-            "Remove SLC outro from end",
-            min_value=0.0,
-            max_value=300.0,
-            value=10.0,
-            step=0.1,
-            format="%.1f",
-            help="Seconds removed from the end of every queued video.",
-        )
+        trim_start = st.number_input("Remove SLC intro from start (s)", min_value=0.0, max_value=300.0, value=9.0, step=0.1, format="%.1f")
+        outro_remove = st.number_input("Remove SLC outro from end (s)", min_value=0.0, max_value=300.0, value=10.0, step=0.1, format="%.1f")
 
         st.divider()
         x, y, w, h = FIXED_SLC_LOGO_BOX
-        st.caption(f"Brand logo replacement: X={x}, Y={y}, W={w}, H={h}")
-        st.caption(f"Cover title: {COVER_TITLE_FONT_SIZE}px max, {COVER_TITLE_MIN_FONT_SIZE}px min, font {active_font_label()}")
+        st.caption(f"Logo replacement: X={x} Y={y} W={w} H={h}")
+        st.caption(f"Font: {active_font_label()}")
         st.caption(f"FFmpeg: {Path(get_ffmpeg_exe()).name}")
 
     render_queue_metrics()
-
     left, right = st.columns([0.95, 1.05], gap="large")
 
     with left:
         with st.container(border=True):
             st.subheader("1. Add videos to queue")
-            st.markdown('<p class="muted">Set default intro text for new videos. You can still edit each video later.</p>', unsafe_allow_html=True)
-            default_course = st.text_input(
-                "Default course name",
-                value="LEVEL 4 DIPLOMA IN EDUCATION STUDIES (RQF)",
-                key="default_course_name",
-            )
+            st.markdown('<p class="muted">Set default intro text for all new videos. Edit each one individually after adding.</p>', unsafe_allow_html=True)
+            default_course = st.text_input("Default course name", value="LEVEL 4 DIPLOMA IN EDUCATION STUDIES (RQF)", key="default_course_name")
             default_unit_name = st.text_input("Default unit/chapter name", value="CHAPTER 01", key="default_unit_name")
-            uploaded_videos = st.file_uploader(
-                "Choose SLC videos",
-                type=["mp4", "mov", "avi", "mkv"],
-                accept_multiple_files=True,
-                help="Files are added to the queue only after you click Add to queue.",
-            )
-            add_disabled = not uploaded_videos
-            if st.button("Add to queue", type="primary", use_container_width=True, disabled=add_disabled):
+            uploaded_videos = st.file_uploader("Choose SLC videos", type=["mp4", "mov", "avi", "mkv"], accept_multiple_files=True)
+            if st.button("Add to queue", type="primary", use_container_width=True, disabled=not uploaded_videos):
                 added, skipped = add_uploads_to_queue(uploaded_videos, brand, default_course, default_unit_name)
                 if added:
-                    st.success(f"Added {added} video(s) to the queue.")
+                    st.success(f"Added {added} video(s).")
                 if skipped:
-                    st.info(f"Skipped {skipped} duplicate video(s).")
+                    st.info(f"Skipped {skipped} duplicate(s).")
 
         with st.container(border=True):
             st.subheader("2. Queue controls")
             st.markdown(
-                '<div class="fixed-logo-note">The tool hides the exact old SLC logo footprint at X=1722, Y=966, W=106, H=60, then adds the selected brand logo with that same exact size and position.</div>',
+                '<div class="fixed-logo-note">The real intro video is used. Your course name replaces the baked-in text. '
+                'The SLC logo at X=1722, Y=966 (106×60 px) is replaced with the selected brand logo.</div>',
                 unsafe_allow_html=True,
             )
             st.write("")
             c1, c2, c3 = st.columns(3)
             pending_count = queue_counts().get("Queued", 0) + queue_counts().get("Failed", 0)
             with c1:
-                start_clicked = st.button("Start / resume queue", type="primary", use_container_width=True, disabled=(pending_count == 0 or logo_path is None))
+                start_clicked = st.button("▶ Start / resume queue", type="primary", use_container_width=True, disabled=(pending_count == 0 or logo_path is None))
             with c2:
-                st.button("Retry failed", use_container_width=True, disabled=queue_counts().get("Failed", 0) == 0, on_click=requeue_failed_jobs)
+                st.button("↩ Retry failed", use_container_width=True, disabled=queue_counts().get("Failed", 0) == 0, on_click=requeue_failed_jobs)
             with c3:
-                st.button("Clear queue", use_container_width=True, disabled=queue_counts().get("Total", 0) == 0, on_click=clear_queue)
+                st.button("🗑 Clear queue", use_container_width=True, disabled=queue_counts().get("Total", 0) == 0, on_click=clear_queue)
 
             if start_clicked and logo_path is not None:
-                process_queue(
-                    brand=brand,
-                    logo_path=logo_path,
-                    trim_start=float(trim_start),
-                    outro_remove=float(outro_remove),
-                    speed_mode=speed_mode,
-                )
+                process_queue(brand=brand, logo_path=logo_path, trim_start=float(trim_start), outro_remove=float(outro_remove), speed_mode=speed_mode)
 
         with st.container(border=True):
-            st.subheader("3. Preview")
-            st.caption("Cover page uses the Intro.mp4 template. Course title is max 52 px, auto-shrinks down to 28 px, and uses Poppins-Bold.ttf when available.")
-
+            st.subheader("3. Intro preview")
+            st.caption("Shows the real intro video with your course name applied (gradient-erases the original text, draws new text).")
             first_job = st.session_state.queue_jobs[0] if st.session_state.queue_jobs else {}
             cover_course = first_job.get("course_name", default_course)
             cover_unit_number = first_job.get("unit_number", "UNIT 01")
             cover_unit_name = first_job.get("unit_name", default_unit_name)
-            if logo_path is not None:
-                intro_preview = create_intro_cover_preview_image(logo_path, brand, cover_course, cover_unit_number, cover_unit_name)
+
+            if intro_clip:
+                intro_preview = preview_intro_frame(brand, cover_course, cover_unit_number, cover_unit_name)
             else:
                 intro_preview = None
 
             if intro_preview is not None:
-                st.image(intro_preview, caption="Cover page preview for the first queued video", use_container_width=True)
+                st.image(intro_preview, caption="Intro preview — real video + your course name", use_container_width=True)
             else:
-                st.info("Add a video to preview the generated cover page.")
+                st.info("Add videos and ensure the intro .mp4 file is present to see the preview.")
 
             preview = get_first_queued_video_preview(float(trim_start))
             if preview is not None:
-                st.image(preview, caption="Exact 106 × 60 logo replacement area on the first queued video", use_container_width=True)
+                st.image(preview, caption="SLC logo replacement area on first queued video", use_container_width=True)
             else:
-                st.info("Add a video to see the fixed SLC logo replacement preview.")
+                st.info("Add a video to see the logo replacement preview.")
 
     with right:
         with st.container(border=True):
@@ -1632,20 +1416,17 @@ def main() -> None:
             if rows:
                 st.dataframe(rows, use_container_width=True, hide_index=True)
             else:
-                st.markdown(
-                    '<div class="queue-tip">No videos in the queue yet. Upload videos on the left, then click <b>Add to queue</b>.</div>',
-                    unsafe_allow_html=True,
-                )
+                st.markdown('<div class="queue-tip">No videos yet. Upload on the left, then click <b>Add to queue</b>.</div>', unsafe_allow_html=True)
 
         with st.container(border=True):
-            st.subheader("Edit intro text video by video")
+            st.subheader("Edit intro text — video by video")
             if not st.session_state.queue_jobs:
                 st.info("Queue is empty.")
             else:
-                auto_col1, auto_col2, auto_col3 = st.columns([1, 1, 1])
-                with auto_col1:
+                a1, a2, a3 = st.columns(3)
+                with a1:
                     auto_start = st.number_input("Auto unit start", min_value=1, max_value=999, value=1, step=1)
-                with auto_col2:
+                with a2:
                     if st.button("Auto-number units", use_container_width=True):
                         for i, job in enumerate(st.session_state.queue_jobs, start=int(auto_start)):
                             old = job.get("unit_number", "")
@@ -1653,29 +1434,23 @@ def main() -> None:
                             if job.get("status") == "Done" and job["unit_number"] != old:
                                 requeue_job(job)
                         st.success("Unit numbers updated.")
-                with auto_col3:
+                with a3:
                     st.button("Requeue all", use_container_width=True, on_click=requeue_all_jobs)
 
-                st.caption("Changing a completed item will automatically move it back to Queued so the output is regenerated.")
+                st.caption("Editing a completed item automatically moves it back to Queued.")
 
                 for i, job in enumerate(st.session_state.queue_jobs, start=1):
                     status = job.get("status", "Queued")
-                    title = f"{i}. {job.get('name', '')} — {status}"
-                    with st.expander(title, expanded=(i == 1 and status != "Done")):
+                    with st.expander(f"{i}. {job.get('name', '')} — {status}", expanded=(i == 1 and status != "Done")):
                         st.markdown(status_badge(status), unsafe_allow_html=True)
-                        st.caption(f"Input size: {job.get('size_label', '')}")
-                        old_values = (
-                            job.get("course_name", ""),
-                            job.get("unit_number", ""),
-                            job.get("unit_name", ""),
-                            job.get("output_name", ""),
-                        )
+                        st.caption(f"Input: {job.get('size_label', '')}")
+                        old_values = (job.get("course_name", ""), job.get("unit_number", ""), job.get("unit_name", ""), job.get("output_name", ""))
 
                         course_name = st.text_input("Course name", value=job.get("course_name", ""), key=f"course_{job['job_id']}")
-                        unit_col1, unit_col2 = st.columns([0.35, 0.65])
-                        with unit_col1:
+                        u1, u2 = st.columns([0.35, 0.65])
+                        with u1:
                             unit_number = st.text_input("Unit number", value=job.get("unit_number", ""), key=f"unit_no_{job['job_id']}")
-                        with unit_col2:
+                        with u2:
                             unit_name = st.text_input("Unit/chapter name", value=job.get("unit_name", ""), key=f"unit_name_{job['job_id']}")
                         output_name = st.text_input("Output file name", value=job.get("output_name", ""), key=f"output_{job['job_id']}")
 
@@ -1684,78 +1459,50 @@ def main() -> None:
                             requeue_job(job)
                         job["course_name"], job["unit_number"], job["unit_name"], job["output_name"] = new_values
 
-                        action_col1, action_col2, action_col3 = st.columns(3)
-                        with action_col1:
+                        b1, b2, b3 = st.columns(3)
+                        with b1:
                             st.button("Remove", key=f"remove_{job['job_id']}", use_container_width=True, on_click=remove_job, args=(job["job_id"],), disabled=(job.get("status") == "Processing"))
-                        with action_col2:
+                        with b2:
                             if st.button("Requeue", key=f"requeue_{job['job_id']}", use_container_width=True, disabled=(job.get("status") == "Processing")):
                                 requeue_job(job)
                                 st.success("Moved back to Queued.")
-                        with action_col3:
-                            output_path_text = job.get("output_path") or ""
-                            output_path = Path(output_path_text) if output_path_text else Path("__missing_output__")
-                            can_download = job.get("status") == "Done" and bool(output_path_text) and output_path.exists() and output_path.is_file()
-                            if can_download:
-                                st.download_button(
-                                    "Download",
-                                    data=output_path.read_bytes(),
-                                    file_name=Path(job.get("output_name", output_path.name)).name,
-                                    mime="video/mp4",
-                                    key=f"download_{job['job_id']}",
-                                    use_container_width=True,
-                                )
+                        with b3:
+                            op_text = job.get("output_path") or ""
+                            op = Path(op_text) if op_text else Path("__missing__")
+                            can_dl = job.get("status") == "Done" and bool(op_text) and op.exists() and op.is_file()
+                            if can_dl:
+                                st.download_button("Download", data=op.read_bytes(), file_name=Path(job.get("output_name", op.name)).name, mime="video/mp4", key=f"dl_{job['job_id']}", use_container_width=True)
                             else:
-                                st.button("Download", key=f"download_disabled_{job['job_id']}", disabled=True, use_container_width=True)
+                                st.button("Download", key=f"dl_dis_{job['job_id']}", disabled=True, use_container_width=True)
 
                         if job.get("status") == "Done":
-                            st.success(f"Output ready: {job.get('output_size_label', '')} | {job.get('duration_label', '')}")
+                            st.success(f"Ready: {job.get('output_size_label', '')} | {job.get('duration_label', '')}")
                         if job.get("status") == "Failed":
                             st.error(job.get("error", "Unknown error"))
 
         with st.container(border=True):
             st.subheader("Downloads")
             completed = [
-                job
-                for job in st.session_state.queue_jobs
+                job for job in st.session_state.queue_jobs
                 if job.get("status") == "Done"
                 and bool(job.get("output_path"))
                 and Path(job.get("output_path")).exists()
-                and Path(job.get("output_path")).is_file()
             ]
             if completed:
                 zip_bytes = build_completed_zip(brand)
                 zip_file_name = f"{brand.lower()}_completed_rebranded_videos.zip"
-                st.download_button(
-                    "Download completed videos as ZIP",
-                    data=zip_bytes,
-                    file_name=zip_file_name,
-                    mime="application/zip",
-                    type="primary",
-                    use_container_width=True,
-                )
-                st.caption(f"{len(completed)} completed video(s) available in the ZIP.")
+                st.download_button("⬇ Download completed videos as ZIP", data=zip_bytes, file_name=zip_file_name, mime="application/zip", type="primary", use_container_width=True)
+                st.caption(f"{len(completed)} video(s) ready.")
 
                 with st.expander("Save ZIP to Google Drive folder", expanded=False):
-                    st.caption(
-                        "This saves the ZIP to a Google Drive sync folder or mounted Drive path that the Streamlit server can access. "
-                        "For cloud deployment, mount/connect Drive on the server first."
-                    )
                     if "drive_folder_path" not in st.session_state:
                         st.session_state.drive_folder_path = guess_google_drive_folder()
-                    drive_folder = st.text_input(
-                        "Google Drive folder path",
-                        key="drive_folder_path",
-                        placeholder="Example: /content/drive/MyDrive/Rebranded Videos or C:/Users/You/Google Drive",
-                    )
-                    drive_zip_name = st.text_input(
-                        "ZIP file name",
-                        value=zip_file_name,
-                        key=f"drive_zip_name_{brand.lower()}",
-                    )
+                    drive_folder = st.text_input("Google Drive folder path", key="drive_folder_path", placeholder="/content/drive/MyDrive/Rebranded Videos")
+                    drive_zip_name = st.text_input("ZIP file name", value=zip_file_name, key=f"drive_zip_name_{brand.lower()}")
                     if st.button("Save ZIP to Google Drive folder", use_container_width=True):
                         try:
                             saved_path = save_zip_to_folder(zip_bytes, drive_folder, drive_zip_name)
-                            st.success(f"Saved ZIP: {saved_path}")
+                            st.success(f"Saved: {saved_path}")
                         except Exception as ex:
                             st.error(str(ex))
             else:
