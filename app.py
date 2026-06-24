@@ -36,22 +36,25 @@ SPEED_PROFILES = {
 }
 DEFAULT_SPEED_MODE = "Fast (recommended)"
 
-# Hard-coded from the position requested in the UI screenshot.
+# Hard-coded actual rendered SLC logo footprint.
 # These coordinates are used on the final normalized 1920x1080 video.
-FIXED_SLC_LOGO_BOX = (1640, 933, 272, 126)  # x, y, width, height
+# The tool covers exactly this area, then overlays the brand logo at the same
+# x/y with the same rendered size.
+FIXED_SLC_LOGO_BOX = (1722, 966, 106, 60)  # x, y, width, height
 FIXED_SLC_COVER_COLOR = "#FFFFFF"
-FIXED_SLC_COVER_BLEED = 8
+FIXED_SLC_COVER_BLEED = 0
 
 INTRO_DURATION = 5.0
 
 # Cover page template/layout copied from the provided Intro.mp4.
 # This keeps the course title, unit pill, logo position, sizes, and spacing fixed.
 INTRO_COVER_TEMPLATE_NAME = "intro_cover_template.png"
-COVER_TITLE_FONT_SIZE = 78
-COVER_TITLE_MIN_FONT_SIZE = 46
+COVER_TITLE_FONT_SIZE = 52
+COVER_TITLE_MIN_FONT_SIZE = 28
 COVER_TITLE_MAX_WIDTH = 1300
 COVER_TITLE_TOP_Y = 360
-COVER_TITLE_LINE_STEP = 99
+COVER_TITLE_LINE_STEP = 68
+COVER_TITLE_FONT_NAME = "Poppins-Bold.ttf"
 COVER_UNIT_FONT_SIZE = 50
 COVER_UNIT_MIN_FONT_SIZE = 34
 COVER_UNIT_TEXT_MAX_WIDTH = 980
@@ -349,9 +352,25 @@ def draw_fixed_logo_box(frame):
 
 
 def find_font(bold: bool = True) -> str | None:
-    # Prefer Lato Heavy because it is close to the supplied Intro.mp4 cover title style.
-    # Fall back to common system fonts on Linux, macOS, and Windows.
+    # Prefer Poppins-Bold.ttf for the cover page text.
+    # The font file is not bundled; place it beside app.py or in assets/fonts if
+    # it is not already installed on the machine running Streamlit.
+    base = get_base()
+    env_font = os.environ.get("POPPINS_BOLD_FONT", "").strip()
     candidates = [
+        env_font if bold else "",
+        str(base / COVER_TITLE_FONT_NAME) if bold else "",
+        str(base / "assets" / "fonts" / COVER_TITLE_FONT_NAME) if bold else "",
+        str(base / "fonts" / COVER_TITLE_FONT_NAME) if bold else "",
+        "Poppins-Bold.ttf" if bold else "Poppins-Regular.ttf",
+        "/usr/share/fonts/truetype/poppins/Poppins-Bold.ttf" if bold else "/usr/share/fonts/truetype/poppins/Poppins-Regular.ttf",
+        "/usr/local/share/fonts/Poppins-Bold.ttf" if bold else "/usr/local/share/fonts/Poppins-Regular.ttf",
+        str(Path.home() / ".fonts" / "Poppins-Bold.ttf") if bold else str(Path.home() / ".fonts" / "Poppins-Regular.ttf"),
+        "/Library/Fonts/Poppins-Bold.ttf" if bold else "/Library/Fonts/Poppins-Regular.ttf",
+        "/System/Library/Fonts/Supplemental/Poppins Bold.ttf" if bold else "/System/Library/Fonts/Supplemental/Poppins Regular.ttf",
+        "C:/Windows/Fonts/Poppins-Bold.ttf" if bold else "C:/Windows/Fonts/Poppins-Regular.ttf",
+        "C:/Windows/Fonts/Poppins Bold.ttf" if bold else "C:/Windows/Fonts/Poppins Regular.ttf",
+        # Fallback fonts on Linux, macOS, and Windows.
         "/usr/share/fonts/truetype/lato/Lato-Heavy.ttf" if bold else "/usr/share/fonts/truetype/lato/Lato-Regular.ttf",
         "/usr/share/fonts/truetype/lato/Lato-Black.ttf" if bold else "/usr/share/fonts/truetype/lato/Lato-Regular.ttf",
         "/usr/share/fonts/truetype/croscore/Arimo-Bold.ttf" if bold else "/usr/share/fonts/truetype/croscore/Arimo-Regular.ttf",
@@ -362,9 +381,24 @@ def find_font(bold: bool = True) -> str | None:
         "C:/Windows/Fonts/arialbd.ttf" if bold else "C:/Windows/Fonts/arial.ttf",
     ]
     for candidate in candidates:
-        if candidate and Path(candidate).exists():
-            return candidate
+        if not candidate:
+            continue
+        try:
+            if Path(candidate).exists():
+                return candidate
+        except Exception:
+            continue
     return None
+
+
+def active_font_label() -> str:
+    font_path = find_font(bold=True)
+    if not font_path:
+        return "Pillow default fallback"
+    name = Path(font_path).name
+    if name.lower().replace(" ", "-") == COVER_TITLE_FONT_NAME.lower():
+        return COVER_TITLE_FONT_NAME
+    return f"{name} fallback; add {COVER_TITLE_FONT_NAME} for exact Poppins"
 
 def make_font(size: int, bold: bool = True):
     font_path = find_font(bold=bold)
@@ -693,7 +727,7 @@ def process_content_segment(
     speed_mode: str = DEFAULT_SPEED_MODE,
     crf: Optional[int] = None,
 ) -> None:
-    """Cut source, hard-hide the fixed SLC logo box, then add the brand logo in the same box."""
+    """Cut source, hard-hide the exact rendered SLC logo, then add the brand logo in the same footprint."""
     duration = float(trim_end) - float(trim_start)
     if duration <= 0:
         raise ValueError("Trim settings leave no content. Reduce intro/outro removal.")
@@ -711,9 +745,8 @@ def process_content_segment(
     filter_complex = (
         f"[0:v]{video_scale_filter()},"
         f"drawbox=x={cover_x}:y={cover_y}:w={cover_w}:h={cover_h}:color={cover}:t=fill,format=rgba[base];"
-        f"[1:v]format=rgba,"
-        f"scale={w}:{h}:force_original_aspect_ratio=decrease[brandlogo];"
-        f"[base][brandlogo]overlay=x={x}+({w}-w)/2:y={y}+({h}-h)/2:format=auto,"
+        f"[1:v]format=rgba,scale={w}:{h}:flags=lanczos,setsar=1[brandlogo];"
+        f"[base][brandlogo]overlay=x={x}:y={y}:format=auto,"
         f"format=yuv420p[v]"
     )
 
@@ -1278,6 +1311,53 @@ def build_completed_zip(brand: str) -> bytes:
     return buffer.getvalue()
 
 
+def guess_google_drive_folder() -> str:
+    candidates = [
+        Path.home() / "Google Drive",
+        Path.home() / "GoogleDrive",
+        Path.home() / "My Drive",
+        Path.home() / "Google Drive" / "My Drive",
+        Path("/content/drive/MyDrive"),
+        Path("/mnt/drive/MyDrive"),
+        Path("G:/My Drive"),
+        Path("G:/Google Drive"),
+    ]
+    for candidate in candidates:
+        try:
+            if candidate.exists() and candidate.is_dir():
+                return str(candidate)
+        except Exception:
+            continue
+    return ""
+
+
+def safe_zip_name(value: str, fallback_stem: str = "completed_rebranded_videos") -> str:
+    raw = (value or "").strip() or f"{fallback_stem}.zip"
+    raw = raw.replace("\\", "_").replace("/", "_").strip()
+    raw = re.sub(r"[^A-Za-z0-9._ -]+", "_", raw)
+    raw = re.sub(r"\s+", " ", raw).strip(" ._")
+    if not raw:
+        raw = f"{fallback_stem}.zip"
+    if raw.lower().endswith(".mp4"):
+        raw = raw[:-4]
+    if not raw.lower().endswith(".zip"):
+        raw += ".zip"
+    return raw
+
+
+def save_zip_to_folder(zip_bytes: bytes, folder_text: str, file_name: str) -> Path:
+    if not zip_bytes:
+        raise ValueError("No completed ZIP data is available yet.")
+    folder_text = (folder_text or "").strip()
+    if not folder_text:
+        raise ValueError("Enter a Google Drive folder path first.")
+    folder = Path(folder_text).expanduser()
+    folder.mkdir(parents=True, exist_ok=True)
+    output_path = folder / safe_zip_name(file_name)
+    output_path.write_bytes(zip_bytes)
+    return output_path
+
+
 def get_first_queued_video_preview(trim_start: float) -> Optional[Image.Image]:
     if not st.session_state.queue_jobs:
         return None
@@ -1464,7 +1544,8 @@ def main() -> None:
 
         st.divider()
         x, y, w, h = FIXED_SLC_LOGO_BOX
-        st.caption(f"Fixed SLC logo box: X={x}, Y={y}, W={w}, H={h}")
+        st.caption(f"Brand logo replacement: X={x}, Y={y}, W={w}, H={h}")
+        st.caption(f"Cover title: {COVER_TITLE_FONT_SIZE}px max, {COVER_TITLE_MIN_FONT_SIZE}px min, font {active_font_label()}")
         st.caption(f"FFmpeg: {Path(get_ffmpeg_exe()).name}")
 
     render_queue_metrics()
@@ -1498,7 +1579,7 @@ def main() -> None:
         with st.container(border=True):
             st.subheader("2. Queue controls")
             st.markdown(
-                '<div class="fixed-logo-note">The tool always hides the old SLC logo at the hard-coded position, then adds the selected brand logo in that same place.</div>',
+                '<div class="fixed-logo-note">The tool hides the exact old SLC logo footprint at X=1722, Y=966, W=106, H=60, then adds the selected brand logo with that same exact size and position.</div>',
                 unsafe_allow_html=True,
             )
             st.write("")
@@ -1522,7 +1603,7 @@ def main() -> None:
 
         with st.container(border=True):
             st.subheader("3. Preview")
-            st.caption("Cover page layout is hard-coded from your Intro.mp4 template: same title size, unit pill, logo position, and spacing.")
+            st.caption("Cover page uses the Intro.mp4 template. Course title is max 52 px, auto-shrinks down to 28 px, and uses Poppins-Bold.ttf when available.")
 
             first_job = st.session_state.queue_jobs[0] if st.session_state.queue_jobs else {}
             cover_course = first_job.get("course_name", default_course)
@@ -1540,7 +1621,7 @@ def main() -> None:
 
             preview = get_first_queued_video_preview(float(trim_start))
             if preview is not None:
-                st.image(preview, caption="Fixed SLC logo replacement box on the first queued video", use_container_width=True)
+                st.image(preview, caption="Exact 106 × 60 logo replacement area on the first queued video", use_container_width=True)
             else:
                 st.info("Add a video to see the fixed SLC logo replacement preview.")
 
@@ -1643,15 +1724,40 @@ def main() -> None:
             ]
             if completed:
                 zip_bytes = build_completed_zip(brand)
+                zip_file_name = f"{brand.lower()}_completed_rebranded_videos.zip"
                 st.download_button(
-                    "Download all completed videos as ZIP",
+                    "Download completed videos as ZIP",
                     data=zip_bytes,
-                    file_name=f"{brand.lower()}_completed_rebranded_videos.zip",
+                    file_name=zip_file_name,
                     mime="application/zip",
                     type="primary",
                     use_container_width=True,
                 )
-                st.caption(f"{len(completed)} completed video(s) available.")
+                st.caption(f"{len(completed)} completed video(s) available in the ZIP.")
+
+                with st.expander("Save ZIP to Google Drive folder", expanded=False):
+                    st.caption(
+                        "This saves the ZIP to a Google Drive sync folder or mounted Drive path that the Streamlit server can access. "
+                        "For cloud deployment, mount/connect Drive on the server first."
+                    )
+                    if "drive_folder_path" not in st.session_state:
+                        st.session_state.drive_folder_path = guess_google_drive_folder()
+                    drive_folder = st.text_input(
+                        "Google Drive folder path",
+                        key="drive_folder_path",
+                        placeholder="Example: /content/drive/MyDrive/Rebranded Videos or C:/Users/You/Google Drive",
+                    )
+                    drive_zip_name = st.text_input(
+                        "ZIP file name",
+                        value=zip_file_name,
+                        key=f"drive_zip_name_{brand.lower()}",
+                    )
+                    if st.button("Save ZIP to Google Drive folder", use_container_width=True):
+                        try:
+                            saved_path = save_zip_to_folder(zip_bytes, drive_folder, drive_zip_name)
+                            st.success(f"Saved ZIP: {saved_path}")
+                        except Exception as ex:
+                            st.error(str(ex))
             else:
                 st.info("Completed videos will appear here after the queue finishes.")
 
