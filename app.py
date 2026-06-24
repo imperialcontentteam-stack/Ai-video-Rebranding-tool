@@ -1,7 +1,8 @@
 """
-Video Rebranding Tool v13
-Uses the EXACT uploaded Intro.mp4 — only changes course name, unit number and chapter name.
+Video Rebranding Tool v14
+Uses the EXACT uploaded Intro.mp4 — only changes the course name, unit number and chapter name.
 All animations, logo, 3D shapes and audio are preserved perfectly.
+The unit and chapter appear together in the pill box: "UNIT 01 -  CHAPTER 01"
 """
 from __future__ import annotations
 
@@ -501,6 +502,11 @@ def _base() -> Path:
     return Path(__file__).resolve().parent
 
 def _intro_path(brand: str) -> Optional[Path]:
+    # First try the uploaded generic Intro.mp4 (user-supplied template)
+    generic = _base() / "Intro.mp4"
+    if generic.exists():
+        return generic
+    # Fall back to brand-prefixed version
     p = _base() / f"{BRANDS[brand]['prefix']}_intro.mp4"
     return p if p.exists() else None
 
@@ -727,7 +733,7 @@ def main():
     st.markdown("""
 <div class="hero">
   <h1>🎬 Video Rebranding Tool</h1>
-  <p>Uses your exact Intro.mp4 — only replaces the course name, unit and chapter text.</p>
+  <p>Uses your exact Intro.mp4 — only replaces the course name, unit number and chapter in the intro.</p>
 </div>""", unsafe_allow_html=True)
 
     # ── Sidebar ───────────────────────────────
@@ -750,7 +756,7 @@ def main():
         if intro:
             st.success(f"✓ {intro.name}")
         else:
-            st.warning(f"Missing: {BRANDS[brand]['prefix']}_intro.mp4")
+            st.warning("Missing: Intro.mp4 (place it beside app.py)")
 
         st.divider()
         speed = st.selectbox("Processing speed", list(SPEED_PROFILES.keys()),
@@ -780,10 +786,13 @@ def main():
     with left:
         with st.container(border=True):
             st.subheader("1 · Add videos")
-            default_course  = st.text_input("Default course name",
+            default_course  = st.text_input("Course name",
                                             "LEVEL 4 DIPLOMA IN EDUCATION STUDIES (RQF)")
-            default_unit    = st.text_input("Default unit number", "UNIT 01")
-            default_chapter = st.text_input("Default chapter name", "CHAPTER 01")
+            dc1, dc2 = st.columns(2)
+            with dc1:
+                default_unit    = st.text_input("Unit number", "UNIT 01")
+            with dc2:
+                default_chapter = st.text_input("Chapter name", "CHAPTER 01")
             uploads = st.file_uploader("Choose SLC videos", ["mp4","mov","avi","mkv"],
                                        accept_multiple_files=True)
             if st.button("Add to queue", type="primary", use_container_width=True,
@@ -796,7 +805,7 @@ def main():
             st.subheader("2 · Process")
             st.markdown(
                 '<div class="info-box">The exact <b>Intro.mp4</b> is used. '
-                'Only the course title, unit number and chapter name are replaced. '
+                'Only the course name, unit number and chapter name are replaced in the intro. '
                 'All animations, music and the Aspirex logo are kept intact.</div>',
                 unsafe_allow_html=True)
             st.write("")
