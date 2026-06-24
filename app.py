@@ -44,6 +44,25 @@ FIXED_SLC_COVER_BLEED = 8
 
 INTRO_DURATION = 5.0
 
+# Cover page template/layout copied from the provided Intro.mp4.
+# This keeps the course title, unit pill, logo position, sizes, and spacing fixed.
+INTRO_COVER_TEMPLATE_NAME = "intro_cover_template.png"
+COVER_TITLE_FONT_SIZE = 78
+COVER_TITLE_MIN_FONT_SIZE = 46
+COVER_TITLE_MAX_WIDTH = 1300
+COVER_TITLE_TOP_Y = 360
+COVER_TITLE_LINE_STEP = 99
+COVER_UNIT_FONT_SIZE = 50
+COVER_UNIT_MIN_FONT_SIZE = 34
+COVER_UNIT_TEXT_MAX_WIDTH = 980
+COVER_PILL_Y = 612
+COVER_PILL_HEIGHT = 102
+COVER_PILL_MIN_WIDTH = 650
+COVER_PILL_MAX_WIDTH = 1180
+COVER_LOGO_CENTER = (960, 933)
+COVER_LOGO_MAX_SIZE = (250, 70)
+COVER_LOGO_CLEANUP_BOX = (760, 875, 400, 125)
+
 BRANDS = {
     "Aspirex": {
         "prefix": "aspirex",
@@ -330,7 +349,13 @@ def draw_fixed_logo_box(frame):
 
 
 def find_font(bold: bool = True) -> str | None:
+    # Prefer Lato Heavy because it is close to the supplied Intro.mp4 cover title style.
+    # Fall back to common system fonts on Linux, macOS, and Windows.
     candidates = [
+        "/usr/share/fonts/truetype/lato/Lato-Heavy.ttf" if bold else "/usr/share/fonts/truetype/lato/Lato-Regular.ttf",
+        "/usr/share/fonts/truetype/lato/Lato-Black.ttf" if bold else "/usr/share/fonts/truetype/lato/Lato-Regular.ttf",
+        "/usr/share/fonts/truetype/croscore/Arimo-Bold.ttf" if bold else "/usr/share/fonts/truetype/croscore/Arimo-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
         "/System/Library/Fonts/Supplemental/Arial Bold.ttf" if bold else "/System/Library/Fonts/Supplemental/Arial.ttf",
@@ -340,7 +365,6 @@ def find_font(bold: bool = True) -> str | None:
         if candidate and Path(candidate).exists():
             return candidate
     return None
-
 
 def make_font(size: int, bold: bool = True):
     font_path = find_font(bold=bold)
@@ -426,6 +450,89 @@ def paste_logo_center(img: Image.Image, logo_path: Path, center_x: int, center_y
     img.alpha_composite(logo, (center_x - logo.width // 2, center_y - logo.height // 2))
 
 
+def remove_template_logo_patch(img: Image.Image) -> Image.Image:
+    """Smooth the old logo area in the template before adding the chosen brand logo."""
+    x, y, w, h = COVER_LOGO_CLEANUP_BOX
+    x = max(0, min(int(x), img.width - 1))
+    y = max(0, min(int(y), img.height - 1))
+    w = max(1, min(int(w), img.width - x))
+    h = max(1, min(int(h), img.height - y))
+
+    patch = img.crop((x, y, x + w, y + h)).filter(ImageFilter.GaussianBlur(18))
+    mask = Image.new("L", (w, h), 0)
+    mask_draw = ImageDraw.Draw(mask)
+    mask_draw.rounded_rectangle([0, 0, w, h], radius=42, fill=255)
+    mask = mask.filter(ImageFilter.GaussianBlur(10))
+    img.paste(patch, (x, y), mask)
+    return img
+
+
+def split_course_title_for_cover(draw: ImageDraw.ImageDraw, course: str, font, max_width: int, max_lines: int = 2) -> list[str]:
+    text = (course or "COURSE NAME").strip().upper()
+    if not text:
+        return ["COURSE NAME"]
+
+    words = text.split()
+    lines: list[str] = []
+    current = ""
+    word_index = 0
+
+    while word_index < len(words):
+        word = words[word_index]
+        trial = word if not current else f"{current} {word}"
+        if text_size(draw, trial, font)[0] <= max_width or not current:
+            current = trial
+            word_index += 1
+            continue
+
+        lines.append(current)
+        current = ""
+        if len(lines) >= max_lines - 1:
+            current = " ".join(words[word_index:])
+            word_index = len(words)
+            break
+
+    if current:
+        lines.append(current)
+
+    lines = lines[:max_lines]
+    clipped: list[str] = []
+    for line in lines:
+        if text_size(draw, line, font)[0] <= max_width:
+            clipped.append(line)
+            continue
+        value = line
+        while value and text_size(draw, value + "...", font)[0] > max_width:
+            value = value[:-1]
+        clipped.append((value.rstrip() + "...") if value else line[:24])
+    return clipped or [text]
+
+
+def fit_course_title_for_cover(draw: ImageDraw.ImageDraw, course: str) -> tuple[object, list[str]]:
+    for size in range(COVER_TITLE_FONT_SIZE, COVER_TITLE_MIN_FONT_SIZE - 1, -2):
+        font = make_font(size, bold=True)
+        lines = split_course_title_for_cover(draw, course, font, COVER_TITLE_MAX_WIDTH, max_lines=2)
+        if all(text_size(draw, line, font)[0] <= COVER_TITLE_MAX_WIDTH for line in lines):
+            return font, lines
+    font = make_font(COVER_TITLE_MIN_FONT_SIZE, bold=True)
+    return font, split_course_title_for_cover(draw, course, font, COVER_TITLE_MAX_WIDTH, max_lines=2)
+
+
+def draw_cover_text_with_shadow(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font,
+    center_x: int,
+    top_y: int,
+    fill: tuple[int, int, int, int],
+) -> None:
+    w, _ = text_size(draw, text, font)
+    x = center_x - w // 2
+    # Soft purple shadow from the supplied cover page.
+    draw.text((x + 3, top_y + 5), text, font=font, fill=(72, 41, 120, 105))
+    draw.text((x, top_y), text, font=font, fill=fill)
+
+
 def create_intro_image(
     logo_path: Path,
     output_png: Path,
@@ -439,86 +546,72 @@ def create_intro_image(
     unit_title = (unit_name or "CHAPTER 01").strip().upper()
     unit_line = unit_no if not unit_title else f"{unit_no} - {unit_title}"
 
-    cfg = BRANDS[brand]
-    bg = cfg["intro_bg"]
-    accent = cfg["intro_accent"]
-    text_fill = cfg["intro_text"]
-    pill_text = cfg["intro_pill_text"]
-
-    img = Image.new("RGBA", (TARGET_WIDTH, TARGET_HEIGHT), bg)
-
-    # Draw semi-transparent decoration on a separate layer, then composite it.
-    # Drawing alpha directly onto the base image can make shapes turn solid when
-    # the frame is flattened to RGB for video encoding.
-    decor = Image.new("RGBA", img.size, (0, 0, 0, 0))
-    decor_draw = ImageDraw.Draw(decor, "RGBA")
-
-    if brand == "Aspirex":
-        decor_draw.ellipse((-210, -260, 470, 420), fill=(255, 255, 255, 28))
-        decor_draw.ellipse((-140, -180, 340, 300), outline=(255, 255, 255, 45), width=70)
-        decor_draw.ellipse((1430, 640, 2140, 1350), fill=(110, 36, 183, 70))
-        decor_draw.line((1480, 1040, 2040, 610), fill=(255, 255, 255, 45), width=6)
-        dot_fill = (255, 255, 255, 225)
+    template_path = get_base() / INTRO_COVER_TEMPLATE_NAME
+    if template_path.exists():
+        img = Image.open(template_path).convert("RGBA").resize((TARGET_WIDTH, TARGET_HEIGHT), Image.Resampling.LANCZOS)
     else:
-        decor_draw.ellipse((-260, -240, 520, 520), fill=(41, 171, 226, 28))
-        decor_draw.ellipse((1380, 630, 2160, 1410), fill=(26, 46, 74, 18))
-        decor_draw.line((1320, 910, 1940, 590), fill=(41, 171, 226, 80), width=7)
-        dot_fill = (41, 171, 226, 210)
+        # Fallback if the template image is accidentally removed.
+        img = Image.new("RGBA", (TARGET_WIDTH, TARGET_HEIGHT), "#9654DD")
 
-    for start_x, start_y in ((105, 845), (1665, 110)):
-        for row in range(4):
-            for col in range(4):
-                cx = start_x + col * 44
-                cy = start_y + row * 38
-                decor_draw.ellipse((cx, cy, cx + 10, cy + 10), fill=dot_fill)
-
-    img = Image.alpha_composite(img, decor)
+    img = remove_template_logo_patch(img)
     draw = ImageDraw.Draw(img, "RGBA")
 
-    course_font = make_font(64, bold=True)
-    course_lines = wrap_text(draw, course, course_font, max_width=1480, max_lines=2)
-    # If course wraps, use a slightly smaller font for a cleaner title block.
-    if len(course_lines) > 1:
-        course_font = make_font(56, bold=True)
-        course_lines = wrap_text(draw, course, course_font, max_width=1500, max_lines=2)
+    title_font, title_lines = fit_course_title_for_cover(draw, course)
+    title_top_y = COVER_TITLE_TOP_Y
+    if len(title_lines) == 1:
+        # Keep a one-line title in the same vertical band as the supplied template.
+        title_top_y = COVER_TITLE_TOP_Y
 
-    y_after_title = draw_centered_lines(
+    for i, line in enumerate(title_lines):
+        draw_cover_text_with_shadow(
+            draw,
+            line,
+            title_font,
+            center_x=TARGET_WIDTH // 2,
+            top_y=title_top_y + i * COVER_TITLE_LINE_STEP,
+            fill=(255, 255, 255, 255),
+        )
+
+    unit_font = fit_font_for_text(
         draw,
-        course_lines,
-        course_font,
-        center_x=TARGET_WIDTH // 2,
-        top_y=350 if len(course_lines) == 1 else 300,
-        fill=text_fill,
-        line_gap=22,
-        shadow=(brand == "Aspirex"),
+        unit_line,
+        max_width=COVER_UNIT_TEXT_MAX_WIDTH,
+        start_size=COVER_UNIT_FONT_SIZE,
+        min_size=COVER_UNIT_MIN_FONT_SIZE,
+        bold=True,
     )
-
-    unit_font = fit_font_for_text(draw, unit_line, max_width=1060, start_size=46, min_size=30, bold=True)
     unit_w, unit_h = text_size(draw, unit_line, unit_font)
-    pill_w = min(max(unit_w + 140, 560), 1220)
-    pill_h = unit_h + 48
+    pill_w = min(max(unit_w + 150, COVER_PILL_MIN_WIDTH), COVER_PILL_MAX_WIDTH)
+    pill_h = COVER_PILL_HEIGHT
     pill_x = (TARGET_WIDTH - pill_w) // 2
-    pill_y = max(y_after_title + 45, 545)
+    pill_y = COVER_PILL_Y
 
-    # Soft shadow behind the unit pill.
     shadow = Image.new("RGBA", img.size, (0, 0, 0, 0))
     shadow_draw = ImageDraw.Draw(shadow)
     shadow_draw.rounded_rectangle(
         [pill_x + 8, pill_y + 10, pill_x + pill_w + 8, pill_y + pill_h + 10],
-        radius=38,
-        fill=(0, 0, 0, 60),
+        radius=50,
+        fill=(55, 20, 95, 95),
     )
-    shadow = shadow.filter(ImageFilter.GaussianBlur(8))
+    shadow = shadow.filter(ImageFilter.GaussianBlur(9))
     img.alpha_composite(shadow)
 
     draw = ImageDraw.Draw(img, "RGBA")
-    draw.rounded_rectangle([pill_x, pill_y, pill_x + pill_w, pill_y + pill_h], radius=38, fill=(255, 255, 255, 245))
-    draw.rounded_rectangle([pill_x, pill_y, pill_x + pill_w, pill_y + pill_h], radius=38, outline=accent, width=4)
-    draw.text((TARGET_WIDTH // 2 - unit_w // 2, pill_y + (pill_h - unit_h) // 2 - 4), unit_line, font=unit_font, fill=pill_text)
+    draw.rounded_rectangle([pill_x, pill_y, pill_x + pill_w, pill_y + pill_h], radius=50, fill=(255, 255, 255, 255))
+    draw.rounded_rectangle([pill_x, pill_y, pill_x + pill_w, pill_y + pill_h], radius=50, outline=(220, 193, 246, 255), width=7)
+    draw.text(
+        (TARGET_WIDTH // 2 - unit_w // 2, pill_y + (pill_h - unit_h) // 2 - 8),
+        unit_line,
+        font=unit_font,
+        fill=(91, 43, 130, 255),
+    )
 
-    paste_logo_center(img, logo_path, TARGET_WIDTH // 2, 918, max_width=330, max_height=120)
+    if logo_path and logo_path.exists():
+        logo_center_x, logo_center_y = COVER_LOGO_CENTER
+        logo_max_w, logo_max_h = COVER_LOGO_MAX_SIZE
+        paste_logo_center(img, logo_path, logo_center_x, logo_center_y, max_width=logo_max_w, max_height=logo_max_h)
+
     img.convert("RGB").save(output_png, quality=95)
-
 
 def create_dynamic_intro_clip(
     logo_path: Path,
@@ -1208,6 +1301,26 @@ def get_first_queued_video_preview(trim_start: float) -> Optional[Image.Image]:
             preview_path.unlink(missing_ok=True)
 
 
+def create_intro_cover_preview_image(
+    logo_path: Path,
+    brand: str,
+    course_name: str,
+    unit_number: str,
+    unit_name: str,
+) -> Optional[Image.Image]:
+    preview_path: Optional[Path] = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp_file:
+            preview_path = Path(tmp_file.name)
+        create_intro_image(logo_path, preview_path, brand, course_name, unit_number, unit_name)
+        return Image.open(preview_path).convert("RGB").copy()
+    except Exception:
+        return None
+    finally:
+        if preview_path is not None:
+            preview_path.unlink(missing_ok=True)
+
+
 def update_queue_table(slot) -> None:
     rows = make_queue_rows()
     if rows:
@@ -1409,11 +1522,27 @@ def main() -> None:
 
         with st.container(border=True):
             st.subheader("3. Preview")
+            st.caption("Cover page layout is hard-coded from your Intro.mp4 template: same title size, unit pill, logo position, and spacing.")
+
+            first_job = st.session_state.queue_jobs[0] if st.session_state.queue_jobs else {}
+            cover_course = first_job.get("course_name", default_course)
+            cover_unit_number = first_job.get("unit_number", "UNIT 01")
+            cover_unit_name = first_job.get("unit_name", default_unit_name)
+            if logo_path is not None:
+                intro_preview = create_intro_cover_preview_image(logo_path, brand, cover_course, cover_unit_number, cover_unit_name)
+            else:
+                intro_preview = None
+
+            if intro_preview is not None:
+                st.image(intro_preview, caption="Cover page preview for the first queued video", use_container_width=True)
+            else:
+                st.info("Add a video to preview the generated cover page.")
+
             preview = get_first_queued_video_preview(float(trim_start))
             if preview is not None:
                 st.image(preview, caption="Fixed SLC logo replacement box on the first queued video", use_container_width=True)
             else:
-                st.info("Add a video to see the fixed logo replacement preview.")
+                st.info("Add a video to see the fixed SLC logo replacement preview.")
 
     with right:
         with st.container(border=True):

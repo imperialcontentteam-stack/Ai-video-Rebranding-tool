@@ -1,6 +1,6 @@
-# Video Rebranding Queue Tool v9
+# Video Rebranding Queue Tool v10
 
-This version keeps the workflow simple and adds a processing queue.
+This version keeps the queue workflow from v9 and updates the generated intro cover page to match the supplied `Intro.mp4` cover design.
 
 ## What it does
 
@@ -12,7 +12,12 @@ This version keeps the workflow simple and adds a processing queue.
   - Width = 272
   - Height = 126
 - Adds the selected brand logo in the same fixed place.
-- Generates a new intro for each video using that video's course name, unit number, and unit/chapter name.
+- Generates a new intro cover page for each video using that video's course name, unit number, and unit/chapter name.
+- Uses the `Intro.mp4` cover-page style:
+  - same purple background template
+  - same large course-title size and spacing
+  - same white unit/chapter pill
+  - same bottom-center logo size and position
 - Adds the selected brand outro.
 - Processes many uploaded videos through a queue.
 - Shows Queued, Processing, Done, and Failed statuses.
@@ -40,5 +45,6 @@ The app uses FFmpeg. If system FFmpeg is not available, it will try to use the F
 3. Upload videos.
 4. Click **Add to queue**.
 5. Edit course name, unit number, unit/chapter name, and output filename for each queued video.
-6. Click **Start / resume queue**.
-7. Download individual outputs or all completed videos as one ZIP.
+6. Check the cover-page preview.
+7. Click **Start / resume queue**.
+8. Download individual outputs or all completed videos as one ZIP.
