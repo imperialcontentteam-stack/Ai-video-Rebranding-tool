@@ -6,15 +6,12 @@ The unit and chapter appear together in the pill box: "UNIT 01 -  CHAPTER 01"
 """
 from __future__ import annotations
 
-import io
 import hashlib
 import os
 import re
 import shutil
 import subprocess
 import tempfile
-import zipfile
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -33,24 +30,36 @@ AUDIO_RATE = 48000
 
 # ─────────────────────────────────────────────
 #  Pixel-measured regions in Intro.mp4
-#  (analysed at 1920×1080, t=5s)
+#  (re-measured directly from the current Intro.mp4 at t=8.5s,
+#   full render settled: line1 rows 380-436, line2 rows 478-565,
+#   pill fill rows 622-708 / cols 642-1276)
 # ─────────────────────────────────────────────
-# Original title text lives at Y=290-455.
-# We erase a slightly wider band for safety.
-TITLE_ERASE_Y = 270
-TITLE_ERASE_H = 200   # covers Y 270-470
+# Original title text lives at Y=380-565 (two lines).
+# We erase a wider band for safety, staying clear of the pill below.
+TITLE_ERASE_Y = 330
+TITLE_ERASE_H = 280   # covers Y 330-610
 
 # New title is rendered centred in that band.
-TITLE_CENTER_Y = 370  # vertical midpoint for new text block
+TITLE_CENTER_Y = 472  # = (380+565)//2 vertical midpoint for new text block
 
-# Original pill:  Y=478-565, X=676-1241, centre X≈958
+# Original pill: Y=622-708, X=642-1276, centre X≈959
 # We erase the full band and redraw.
-PILL_ERASE_Y  = 455
-PILL_ERASE_H  = 160   # covers Y 455-615
+PILL_ERASE_Y  = 595
+PILL_ERASE_H  = 145   # covers Y 595-740
 
 # New pill sits at the same vertical centre as original.
-PILL_CENTER_Y = 521   # = (478+565)//2
+PILL_CENTER_Y = 665   # = (622+708)//2
 PILL_MIN_W    = 580   # wide enough to cover the original
+
+# ─────────────────────────────────────────────
+#  Entrance-animation timing (measured directly from Intro.mp4 by sampling
+#  brightness in each region frame-by-frame — the title fades in gradually,
+#  the pill pops in almost instantly, then its text follows a beat later)
+# ─────────────────────────────────────────────
+TITLE_FADE_START = 0.90   # seconds — title begins fading in
+TITLE_FADE_DUR   = 0.30   # seconds — fade duration
+PILL_FADE_START  = 1.90   # seconds — pill box appears (near-instant in the original)
+PILL_FADE_DUR    = 0.10   # seconds — kept short to match the original's snappy pop-in
 
 # Background colours (sampled from sides of each band)
 TITLE_BG_HEX  = "9B5EE1"
@@ -173,8 +182,8 @@ def scale_filter() -> str:
 def find_font(bold: bool = True) -> Optional[str]:
     base = Path(__file__).parent
     candidates = [
-        os.environ.get("POPPINS_BOLD_FONT", "") if bold else "",
         str(base / ("Poppins-Bold.ttf" if bold else "Poppins-Regular.ttf")),
+        os.environ.get("POPPINS_BOLD_FONT", "") if bold else "",
         "/usr/share/fonts/truetype/poppins/Poppins-Bold.ttf" if bold else "/usr/share/fonts/truetype/poppins/Poppins-Regular.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
@@ -188,9 +197,25 @@ def find_font(bold: bool = True) -> Optional[str]:
             return c
     return None
 
+_FONT_FALLBACK_WARNED = False
+
 def make_font(size: int, bold: bool = True):
+    global _FONT_FALLBACK_WARNED
     fp = find_font(bold)
-    return ImageFont.truetype(fp, size) if fp else ImageFont.load_default()
+    if fp:
+        return ImageFont.truetype(fp, size)
+    if not _FONT_FALLBACK_WARNED:
+        _FONT_FALLBACK_WARNED = True
+        try:
+            st.error(
+                "⚠ Poppins-Bold.ttf was not found next to app.py and no system "
+                "font was found either. Falling back to a tiny placeholder font — "
+                "title/pill text will look wrong. Make sure Poppins-Bold.ttf ships "
+                "in the same folder as app.py."
+            )
+        except Exception:
+            pass
+    return ImageFont.load_default()
 
 def tsz(draw, text: str, font) -> Tuple[int, int]:
     bb = draw.textbbox((0, 0), text or " ", font=font)
@@ -235,65 +260,89 @@ def fit_title(draw, text: str, max_w: int):
 
 
 # ─────────────────────────────────────────────
+#  Extract clean background rows from intro video
+# ─────────────────────────────────────────────
+def _extract_clean_bg(intro: Path) -> Optional[np.ndarray]:
+    """
+    Sample the intro at t=280ms (before any text animates in) to get
+    clean background pixel rows for the erase zones.
+    Returns a (1080, 1920, 3) uint8 array, or None on failure.
+    """
+    cap = cv2.VideoCapture(str(intro))
+    cap.set(cv2.CAP_PROP_POS_MSEC, 280)
+    ok, frame = cap.read()
+    cap.release()
+    if not ok:
+        return None
+    arr = np.array(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
+    return arr.astype(np.uint8)
+
+
+# ─────────────────────────────────────────────
 #  Core: build the overlay PNG for one set of text
 # ─────────────────────────────────────────────
-def build_overlay_png(
-    out_png: Path,
-    brand: str,
-    course: str,
-    unit_no: str,
-    chapter: str,
-) -> None:
-    """
-    Two-layer approach so the erase rectangles are never corrupted by
-    semi-transparent pill strokes drawn on the same canvas:
-      Layer A (erase)  — solid-colour rectangles that blank out the original text.
-      Layer B (text)   — new title + new pill on a transparent canvas.
-    Both are saved as a single flat PNG via alpha_composite(A, B).
-    FFmpeg then composites this PNG over every frame of the intro video.
-    """
-    title_bg  = tuple(int(TITLE_BG_HEX[i:i+2], 16) for i in (0, 2, 4))
-    pill_bg_c = tuple(int(PILL_BG_HEX[i:i+2],  16) for i in (0, 2, 4))
+def _clean_bg_layer(intro_path: Optional[Path], erase_y: int, erase_h: int) -> Image.Image:
+    """A full-canvas transparent RGBA image with just one band filled in with
+    real background pixels copied from the intro (or a flat fallback colour)."""
+    arr = np.zeros((TARGET_H, TARGET_W, 4), dtype=np.uint8)
+    clean_bg = _extract_clean_bg(intro_path) if intro_path else None
+    if clean_bg is not None:
+        arr[erase_y:erase_y+erase_h, :, :3] = clean_bg[erase_y:erase_y+erase_h, :, :3]
+        arr[erase_y:erase_y+erase_h, :, 3]  = 255
+    else:
+        bg_hex = TITLE_BG_HEX if erase_y == TITLE_ERASE_Y else PILL_BG_HEX
+        bg = tuple(int(bg_hex[i:i+2], 16) for i in (0, 2, 4))
+        arr[erase_y:erase_y+erase_h, :, :3] = bg
+        arr[erase_y:erase_y+erase_h, :, 3]  = 255
+    return Image.fromarray(arr, "RGBA")
 
+
+def build_title_layers(brand: str, course: str,
+                        intro_path: Optional[Path] = None) -> Tuple[Image.Image, Image.Image]:
+    """Returns (erase_layer, text_layer) for the title band, as separate
+    images so they can be faded in on different schedules."""
     tc = BRANDS[brand]["title_color"]
-    pb = BRANDS[brand]["pill_bg"]
-    pt = BRANDS[brand]["pill_text"]
+    course_text = (course or "COURSE NAME").strip().upper()
 
-    course_text  = (course  or "COURSE NAME").strip().upper()
-    unit_text    = (unit_no or "UNIT 01").strip().upper()
-    chapter_text = (chapter or "CHAPTER 01").strip().upper()
-    pill_line    = f"{unit_text} -  {chapter_text}"
-
-    # ── Layer A: erase ─────────────────────────────────
-    erase = Image.new("RGBA", (TARGET_W, TARGET_H), (0, 0, 0, 0))
-    ed = ImageDraw.Draw(erase, "RGBA")
-    ed.rectangle([0, TITLE_ERASE_Y, TARGET_W, TITLE_ERASE_Y + TITLE_ERASE_H],
-                 fill=(*title_bg,  255))
-    ed.rectangle([0, PILL_ERASE_Y,  TARGET_W, PILL_ERASE_Y  + PILL_ERASE_H],
-                 fill=(*pill_bg_c, 255))
-
-    # ── Layer B: new text + new pill ───────────────────
+    erase = _clean_bg_layer(intro_path, TITLE_ERASE_Y, TITLE_ERASE_H)
     text_layer = Image.new("RGBA", (TARGET_W, TARGET_H), (0, 0, 0, 0))
     draw = ImageDraw.Draw(text_layer, "RGBA")
 
-    # Title
     max_title_w = 1580
     t_font, t_lines = fit_title(draw, course_text, max_title_w)
-    lh = tsz(draw, t_lines[0], t_font)[1]
-    gap = 16
-    total_h = len(t_lines) * lh + (len(t_lines) - 1) * gap
+    ascent, descent = t_font.getmetrics()
+    line_h = ascent + descent          # natural font line-height (matches original spacing)
+    total_h = len(t_lines) * line_h
     title_top = TITLE_CENTER_Y - total_h // 2
 
     for i, line in enumerate(t_lines):
         w, _ = tsz(draw, line, t_font)
         x = TARGET_W // 2 - w // 2
-        y = title_top + i * (lh + gap)
+        y = title_top + i * line_h
         draw.text((x + 3, y + 5), line, font=t_font, fill=(0, 0, 0, 60))
         draw.text((x, y),         line, font=t_font, fill=(*tc, 255))
 
-    # Pill
+    return erase, text_layer
+
+
+def build_pill_layers(brand: str, unit_no: str, chapter: str,
+                       intro_path: Optional[Path] = None) -> Tuple[Image.Image, Image.Image]:
+    """Returns (erase_layer, text_layer) for the pill band, as separate
+    images so they can be faded in on different schedules."""
+    pb = BRANDS[brand]["pill_bg"]
+    pt = BRANDS[brand]["pill_text"]
+    unit_text    = (unit_no or "UNIT 01").strip().upper()
+    chapter_text = (chapter or "CHAPTER 01").strip().upper()
+    pill_line    = f"{unit_text} -  {chapter_text}"
+
+    erase = _clean_bg_layer(intro_path, PILL_ERASE_Y, PILL_ERASE_H)
+    text_layer = Image.new("RGBA", (TARGET_W, TARGET_H), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(text_layer, "RGBA")
+
     p_font = make_font(46)
-    uw, uh = tsz(draw, pill_line, p_font)
+    bbox = draw.textbbox((0, 0), pill_line, font=p_font)
+    top_offset = bbox[1]                     # gap between draw-anchor and true ink top
+    uw, uh = bbox[2]-bbox[0], bbox[3]-bbox[1]
     pw = min(max(uw + 160, PILL_MIN_W), 1080)
     ph = 88
     px = TARGET_W // 2 - pw // 2
@@ -301,11 +350,52 @@ def build_overlay_png(
 
     draw.rounded_rectangle([px, py, px + pw, py + ph], radius=44, fill=(*pb, 255))
     draw.rounded_rectangle([px, py, px + pw, py + ph], radius=44, outline=(*pt, 80), width=5)
-    draw.text((TARGET_W // 2 - uw // 2, py + (ph - uh) // 2 - 4),
+    # True vertical centering: ink runs from (y_drawn + top_offset) to
+    # (y_drawn + top_offset + uh), so subtract top_offset (not a magic
+    # constant) to actually land the ink in the middle of the pill.
+    y_drawn = py + (ph - uh) // 2 - top_offset
+    draw.text((TARGET_W // 2 - uw // 2, y_drawn),
               pill_line, font=p_font, fill=(*pt, 255))
 
-    # ── Merge and save ─────────────────────────────────
+    return erase, text_layer
+
+
+def build_title_overlay_png(out_png: Path, brand: str, course: str,
+                             intro_path: Optional[Path] = None) -> None:
+    """Static (erase+text already merged) title overlay — used for the still preview."""
+    erase, text_layer = build_title_layers(brand, course, intro_path)
     Image.alpha_composite(erase, text_layer).save(out_png)
+
+
+def build_pill_overlay_png(out_png: Path, brand: str, unit_no: str, chapter: str,
+                            intro_path: Optional[Path] = None) -> None:
+    """Static (erase+text already merged) pill overlay — used for the still preview."""
+    erase, text_layer = build_pill_layers(brand, unit_no, chapter, intro_path)
+    Image.alpha_composite(erase, text_layer).save(out_png)
+
+
+def build_overlay_png(
+    out_png: Path,
+    brand: str,
+    course: str,
+    unit_no: str,
+    chapter: str,
+    intro_path: Optional[Path] = None,
+) -> None:
+    """Static (non-animated) combined overlay — used for the still preview
+    image. The real video path uses build_title_overlay_png /
+    build_pill_overlay_png separately so each can fade in at its own time."""
+    title_png = out_png.with_suffix(".title.png")
+    pill_png  = out_png.with_suffix(".pill.png")
+    try:
+        build_title_overlay_png(title_png, brand, course, intro_path)
+        build_pill_overlay_png(pill_png, brand, unit_no, chapter, intro_path)
+        title_img = Image.open(title_png).convert("RGBA")
+        pill_img  = Image.open(pill_png).convert("RGBA")
+        Image.alpha_composite(title_img, pill_img).save(out_png)
+    finally:
+        title_png.unlink(missing_ok=True)
+        pill_png.unlink(missing_ok=True)
 
 
 # ─────────────────────────────────────────────
@@ -316,8 +406,10 @@ def make_preview(brand: str, course: str, unit_no: str, chapter: str) -> Optiona
     if not intro:
         return None
 
+    # Use the same clean frame (t=280ms, before text animates in) as the base
+    # so the preview is free of the original course/unit/chapter text.
     cap = cv2.VideoCapture(str(intro))
-    cap.set(cv2.CAP_PROP_POS_MSEC, 5000)
+    cap.set(cv2.CAP_PROP_POS_MSEC, 280)
     ok, frame = cap.read()
     cap.release()
     if not ok:
@@ -330,8 +422,7 @@ def make_preview(brand: str, course: str, unit_no: str, chapter: str) -> Optiona
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
         tmp = Path(f.name)
     try:
-        build_overlay_png(tmp, brand, course, unit_no, chapter)
-        # The overlay PNG already has erase+text merged; composite once onto base
+        build_overlay_png(tmp, brand, course, unit_no, chapter, intro_path=intro)
         overlay = Image.open(tmp).convert("RGBA")
         return Image.alpha_composite(base, overlay).convert("RGB")
     finally:
@@ -341,6 +432,15 @@ def make_preview(brand: str, course: str, unit_no: str, chapter: str) -> Optiona
 # ─────────────────────────────────────────────
 #  Generate the intro clip with new text
 # ─────────────────────────────────────────────
+# How fast the erase band snaps to fully opaque. Kept short and started
+# slightly before the corresponding text fade so the original graphic is
+# already fully hidden before it would start playing its own entrance
+# animation — otherwise both the original (fading in on its own) and our
+# semi-transparent replacement would be visible at once, producing a
+# double-exposure ghost during the transition.
+ERASE_SNAP_DUR = 0.08
+ERASE_LEAD     = 0.05
+
 def generate_intro_clip(
     out_path: Path,
     brand: str,
@@ -359,23 +459,40 @@ def generate_intro_clip(
     dur = get_duration(intro)
     audio = has_audio(intro)
 
-    overlay_png = out_path.with_suffix(".overlay.png")
+    paths = {
+        "title_erase": out_path.with_suffix(".terase.png"),
+        "title_text":  out_path.with_suffix(".ttext.png"),
+        "pill_erase":  out_path.with_suffix(".perase.png"),
+        "pill_text":   out_path.with_suffix(".ptext.png"),
+    }
     try:
-        build_overlay_png(overlay_png, brand, course, unit_no, chapter)
+        te, tt = build_title_layers(brand, course, intro_path=intro)
+        pe, pt_ = build_pill_layers(brand, unit_no, chapter, intro_path=intro)
+        te.save(paths["title_erase"]);  tt.save(paths["title_text"])
+        pe.save(paths["pill_erase"]);   pt_.save(paths["pill_text"])
 
-        # FFmpeg filter:
-        #  [0] intro video   → scale to 1920×1080, fps=30
-        #  [1] overlay PNG   → loop, composite with alpha
+        title_erase_start = max(TITLE_FADE_START - ERASE_LEAD, 0.0)
+        pill_erase_start  = max(PILL_FADE_START - ERASE_LEAD, 0.0)
+
         vf = (
             f"[0:v]{scale_filter()}[base];"
-            f"[1:v]format=rgba[ov];"
-            f"[base][ov]overlay=0:0:format=auto,format=yuv420p[v]"
+            f"[1:v]format=rgba,fade=t=in:st={title_erase_start}:d={ERASE_SNAP_DUR}:alpha=1[te];"
+            f"[2:v]format=rgba,fade=t=in:st={TITLE_FADE_START}:d={TITLE_FADE_DUR}:alpha=1[tt];"
+            f"[3:v]format=rgba,fade=t=in:st={pill_erase_start}:d={ERASE_SNAP_DUR}:alpha=1[pe];"
+            f"[4:v]format=rgba,fade=t=in:st={PILL_FADE_START}:d={PILL_FADE_DUR}:alpha=1[pt];"
+            f"[base][te]overlay=0:0:format=auto[s1];"
+            f"[s1][tt]overlay=0:0:format=auto[s2];"
+            f"[s2][pe]overlay=0:0:format=auto[s3];"
+            f"[s3][pt]overlay=0:0:format=auto,format=yuv420p[v]"
         )
 
         cmd = [
             "ffmpeg", "-y", "-hide_banner",
             "-i", str(intro),
-            "-loop", "1", "-i", str(overlay_png),
+            "-loop", "1", "-i", str(paths["title_erase"]),
+            "-loop", "1", "-i", str(paths["title_text"]),
+            "-loop", "1", "-i", str(paths["pill_erase"]),
+            "-loop", "1", "-i", str(paths["pill_text"]),
             "-filter_complex", vf,
             "-map", "[v]",
         ]
@@ -384,7 +501,7 @@ def generate_intro_clip(
         else:
             cmd += ["-f", "lavfi", "-t", f"{dur:.3f}",
                     "-i", f"anullsrc=channel_layout=stereo:sample_rate={AUDIO_RATE}",
-                    "-map", "2:a:0"]
+                    "-map", "5:a:0"]
 
         cmd += [
             *enc_args(speed),
@@ -395,7 +512,8 @@ def generate_intro_clip(
         ]
         run(cmd, "Generate intro with text overlay")
     finally:
-        overlay_png.unlink(missing_ok=True)
+        for p in paths.values():
+            p.unlink(missing_ok=True)
 
 
 # ─────────────────────────────────────────────
@@ -531,13 +649,50 @@ def fmt_time(s: float) -> str:
 
 
 # ─────────────────────────────────────────────
-#  Queue processing
+#  Single-video processing
 # ─────────────────────────────────────────────
-@dataclass
-class QFile:
-    name: str
-    data: bytes
-    def getvalue(self): return self.data
+def _cache_dir() -> Path:
+    d = Path(st.session_state.out_dir) / "_cache"
+    d.mkdir(exist_ok=True)
+    return d
+
+def upload_cache_path(uploaded) -> Path:
+    """Write (once per uploaded file) a cached on-disk copy, keyed by name+size,
+    so re-running previews doesn't re-write the bytes every time."""
+    key = hashlib.sha1(f"{uploaded.name}|{uploaded.size}".encode()).hexdigest()[:16]
+    p = _cache_dir() / f"{key}.mp4"
+    if not p.exists():
+        p.write_bytes(uploaded.getvalue())
+    return p
+
+def get_upload_duration(uploaded) -> float:
+    dur, _, _, _ = get_media_info(upload_cache_path(uploaded))
+    return dur
+
+def extract_frame_at(path: Path, t: float) -> Optional[Image.Image]:
+    """Grab a single frame at time t (seconds) as a PIL Image, or None on failure."""
+    t = max(t, 0.0)
+    cap = cv2.VideoCapture(str(path))
+    cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000.0)
+    ok, frame = cap.read()
+    cap.release()
+    if not ok:
+        return None
+    return Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+
+def trim_preview(uploaded, trim_start: float, outro_remove: float):
+    """Returns (first_kept_frame, last_kept_frame, duration) for the given
+    trim settings, so the user can see exactly where the cut lands before
+    processing — trimming a fixed number of seconds blindly risks either
+    leaving old branding in or cutting off real lesson content."""
+    src = upload_cache_path(uploaded)
+    dur = get_upload_duration(uploaded)
+    t0 = float(trim_start)
+    t1 = max(dur - float(outro_remove), 0.0)
+    first = extract_frame_at(src, t0)
+    last  = extract_frame_at(src, max(t1 - 0.05, 0.0))
+    return first, last, dur
+
 
 def process_one(
     uploaded, brand: str, logo: Path, outro_norm: Path,
@@ -568,99 +723,13 @@ def process_one(
     return final
 
 
-# ─────────────────────────────────────────────
-#  Streamlit UI
-# ─────────────────────────────────────────────
-def setup_page():
-    st.set_page_config(page_title="Video Rebranding Tool", page_icon="🎬", layout="wide")
-    st.markdown("""
-<style>
-.block-container{max-width:1200px;padding-top:1.2rem}
-.hero{padding:20px 24px;border-radius:16px;background:linear-gradient(135deg,#15243F,#1A5D82);color:#fff;margin-bottom:14px}
-.hero h1{margin:0;font-size:1.9rem;color:#fff}
-.hero p{margin:6px 0 0;color:#EAF4FB;font-size:.95rem}
-.badge{display:inline-block;padding:3px 9px;border-radius:999px;font-size:.78rem;font-weight:700}
-.bq{background:#EEF2FF;color:#334155}.bp{background:#FFF4D6;color:#8A5200}
-.bd{background:#EAF7EF;color:#166534}.bf{background:#FDECEC;color:#991B1B}
-.info-box{background:#EAF4FB;border-left:4px solid #1565C0;padding:10px 13px;border-radius:8px;color:#16324F;font-size:.9rem}
-</style>""", unsafe_allow_html=True)
-
-
-def init_state():
-    if "jobs" not in st.session_state:
-        st.session_state.jobs = []
-    if "out_dir" not in st.session_state:
-        st.session_state.out_dir = tempfile.mkdtemp(prefix="rebrand_")
-
-
-def badge(status: str) -> str:
-    css = {"queued":"bq","processing":"bp","done":"bd","failed":"bf"}.get(status.lower(),"bq")
-    return f'<span class="badge {css}">{status}</span>'
-
-
-def job_id(name: str, data: bytes) -> str:
-    return hashlib.sha1(f"{name}|{len(data)}|{hashlib.sha1(data).hexdigest()}".encode()).hexdigest()[:14]
-
-
-def add_to_queue(uploads, brand, default_course, default_unit, default_chapter):
-    existing = {j["id"] for j in st.session_state.jobs}
-    added = skipped = 0
-    start = len(st.session_state.jobs) + 1
-    for i, up in enumerate(uploads or []):
-        data = up.getvalue()
-        jid  = job_id(up.name, data)
-        if jid in existing:
-            skipped += 1; continue
-        stem = Path(up.name).stem
-        st.session_state.jobs.append({
-            "id": jid, "name": up.name, "data": data,
-            "size": f"{len(data)/1_048_576:.1f} MB",
-            "course":  default_course.strip() or "COURSE NAME",
-            "unit":    f"UNIT {start+added:02d}",
-            "chapter": default_chapter.strip() or "CHAPTER 01",
-            "out_name": safe_name("", stem, brand),
-            "status": "Queued", "error": "", "output": "",
-            "dur": "", "file_size": "",
-        })
-        existing.add(jid); added += 1
-    return added, skipped
-
-
-def counts():
-    c = {"Total":0,"Queued":0,"Processing":0,"Done":0,"Failed":0}
-    for j in st.session_state.jobs:
-        c["Total"] += 1; c[j["status"]] = c.get(j["status"],0)+1
-    return c
-
-
-def requeue(job):
-    if job["status"] != "Processing":
-        if job["output"] and Path(job["output"]).exists():
-            Path(job["output"]).unlink(missing_ok=True)
-        job.update({"status":"Queued","error":"","output":"","dur":"","file_size":""})
-
-
-def run_queue(brand: str, logo: Path, trim_start: float, outro_remove: float, speed: str):
-    pending = [j for j in st.session_state.jobs if j["status"] in ("Queued","Failed")]
-    if not pending:
-        st.info("Nothing to process."); return
-
-    s_slot = st.empty(); t_slot = st.empty(); p_bar = st.progress(0)
+def run_single(uploaded, brand: str, logo: Path, course: str, unit_no: str,
+                chapter: str, out_name: str, trim_start: float,
+                outro_remove: float, speed: str) -> Path:
     out_dir = Path(st.session_state.out_dir); out_dir.mkdir(exist_ok=True)
-
-    def show(msg, pct):
-        s_slot.info(msg); p_bar.progress(min(max(pct,0),100))
-        rows = [{"#":i+1,"File":j["name"],"Unit":j["unit"],
-                 "Chapter":j["chapter"],"Status":j["status"],
-                 "Size":j["size"]}
-                for i,j in enumerate(st.session_state.jobs)]
-        t_slot.dataframe(rows, use_container_width=True, hide_index=True)
-
     with tempfile.TemporaryDirectory() as tmp:
         tmpdir = Path(tmp)
-        show("Preparing outro…", 3)
-
-        # Prepare outro
+        st.session_state._progress_text = "Preparing outro…"
         outro_raw  = tmpdir / "outro_raw.mp4"
         outro_norm = tmpdir / "outro_norm.mp4"
         op = _outro_path(brand)
@@ -670,56 +739,39 @@ def run_queue(brand: str, logo: Path, trim_start: float, outro_remove: float, sp
             logo_slate(logo, outro_raw, brand, 3.0, speed)
         normalize_clip(outro_raw, outro_norm, speed)
 
-        total = len(pending)
-        for i, job in enumerate(pending, 1):
-            job["status"] = "Processing"
-            show(f"Processing {i}/{total}: {job['name']}", 5 + int((i-1)*88/max(total,1)))
-            try:
-                out_name = safe_name(job["out_name"], Path(job["name"]).stem, brand)
-                result = process_one(
-                    QFile(job["name"], job["data"]),
-                    brand, logo, outro_norm,
-                    float(trim_start), float(outro_remove),
-                    job["course"], job["unit"], job["chapter"],
-                    out_name, tmpdir, i, speed,
-                )
-                dest = out_dir / f"{job['id']}_{out_name}"
-                shutil.copy(result, dest)
-                info_dur, _, _, _ = get_media_info(dest)
-                job.update({
-                    "status": "Done", "output": str(dest),
-                    "out_name": out_name,
-                    "dur": fmt_time(info_dur),
-                    "file_size": f"{dest.stat().st_size/1_048_576:.1f} MB",
-                })
-            except Exception as e:
-                job.update({"status":"Failed","error":str(e)})
-            show(f"Done {i}/{total}: {job['name']}", 5 + int(i*88/max(total,1)))
-
-    show("Queue complete.", 100)
-    c = counts()
-    if c["Failed"]:
-        st.warning(f"{c['Failed']} job(s) failed.")
-    else:
-        st.success("All videos processed!")
+        result = process_one(
+            uploaded, brand, logo, outro_norm,
+            trim_start, outro_remove,
+            course, unit_no, chapter,
+            out_name, tmpdir, 1, speed,
+        )
+        dest = out_dir / out_name
+        shutil.copy(result, dest)
+        return dest
 
 
-def build_zip(brand: str) -> bytes:
-    buf = io.BytesIO()
-    seen: set[str] = set()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for j in st.session_state.jobs:
-            if j["status"] != "Done" or not j["output"]: continue
-            p = Path(j["output"])
-            if not p.exists(): continue
-            name = safe_name(j["out_name"], p.stem, brand)
-            if name in seen:
-                stem, ext = Path(name).stem, Path(name).suffix
-                n = 2
-                while f"{stem}_{n}{ext}" in seen: n += 1
-                name = f"{stem}_{n}{ext}"
-            seen.add(name); zf.write(p, name)
-    return buf.getvalue()
+# ─────────────────────────────────────────────
+#  Streamlit UI
+# ─────────────────────────────────────────────
+def setup_page():
+    st.set_page_config(page_title="Video Rebranding Tool", page_icon="🎬", layout="centered")
+    st.markdown("""
+<style>
+.block-container{max-width:820px;padding-top:1.2rem}
+.hero{padding:20px 24px;border-radius:16px;background:linear-gradient(135deg,#15243F,#1A5D82);color:#fff;margin-bottom:14px}
+.hero h1{margin:0;font-size:1.9rem;color:#fff}
+.hero p{margin:6px 0 0;color:#EAF4FB;font-size:.95rem}
+.info-box{background:#EAF4FB;border-left:4px solid #1565C0;padding:10px 13px;border-radius:8px;color:#16324F;font-size:.9rem}
+</style>""", unsafe_allow_html=True)
+
+
+def init_state():
+    if "out_dir" not in st.session_state:
+        st.session_state.out_dir = tempfile.mkdtemp(prefix="rebrand_")
+    if "result_path" not in st.session_state:
+        st.session_state.result_path = None
+    if "result_error" not in st.session_state:
+        st.session_state.result_error = None
 
 
 def main():
@@ -761,188 +813,105 @@ def main():
         st.divider()
         speed = st.selectbox("Processing speed", list(SPEED_PROFILES.keys()),
                              index=list(SPEED_PROFILES.keys()).index(DEFAULT_SPEED))
-
-        st.divider()
-        trim_start   = st.number_input("Remove from start (s)", 0.0, 300.0, 9.0, 0.5, "%.1f",
-                                       help="Seconds of original SLC intro to cut")
-        outro_remove = st.number_input("Remove from end (s)",   0.0, 300.0, 10.0, 0.5, "%.1f",
-                                       help="Seconds of original SLC outro to cut")
         st.divider()
         fp = find_font()
         st.caption(f"Font: {Path(fp).name if fp else 'PIL default'}")
         st.caption(f"FFmpeg: {Path(get_ffmpeg()).name}")
 
-    # ── Metrics row ───────────────────────────
-    c = counts()
-    m1,m2,m3,m4 = st.columns(4)
-    m1.metric("Total",      c["Total"])
-    m2.metric("Queued",     c["Queued"])
-    m3.metric("Done",       c["Done"])
-    m4.metric("Failed",     c["Failed"])
+    # ── 1 · Video details ─────────────────────
+    with st.container(border=True):
+        st.subheader("1 · Video details")
+        course = st.text_input("Course name", "LEVEL 4 DIPLOMA IN EDUCATION STUDIES (RQF)")
+        c1, c2 = st.columns(2)
+        with c1:
+            unit = st.text_input("Unit number", "UNIT 01")
+        with c2:
+            chapter = st.text_input("Chapter name", "CHAPTER 01")
 
-    left, right = st.columns([1, 1.1], gap="large")
+    # ── 2 · Intro preview ─────────────────────
+    with st.container(border=True):
+        st.subheader("2 · Intro preview")
+        st.caption("Shows the real intro video with your text applied.")
+        prev = make_preview(brand, course, unit, chapter)
+        if prev:
+            st.image(prev, use_container_width=True, caption="Real intro + your text overlay")
+        else:
+            st.info("Intro.mp4 not found.")
 
-    # ── LEFT COLUMN ───────────────────────────
-    with left:
-        with st.container(border=True):
-            st.subheader("1 · Add videos")
-            default_course  = st.text_input("Course name",
-                                            "LEVEL 4 DIPLOMA IN EDUCATION STUDIES (RQF)")
-            dc1, dc2 = st.columns(2)
-            with dc1:
-                default_unit    = st.text_input("Unit number", "UNIT 01")
-            with dc2:
-                default_chapter = st.text_input("Chapter name", "CHAPTER 01")
-            uploads = st.file_uploader("Choose SLC videos", ["mp4","mov","avi","mkv"],
-                                       accept_multiple_files=True)
-            if st.button("Add to queue", type="primary", use_container_width=True,
-                         disabled=not uploads):
-                a, s = add_to_queue(uploads, brand, default_course, default_unit, default_chapter)
-                if a: st.success(f"Added {a} video(s).")
-                if s: st.info(f"Skipped {s} duplicate(s).")
+    # ── 3 · Upload + trim ─────────────────────
+    with st.container(border=True):
+        st.subheader("3 · Upload & trim")
+        uploaded = st.file_uploader("Choose an SLC video", ["mp4", "mov", "avi", "mkv"])
 
-        with st.container(border=True):
-            st.subheader("2 · Process")
-            st.markdown(
-                '<div class="info-box">The exact <b>Intro.mp4</b> is used. '
-                'Only the course name, unit number and chapter name are replaced in the intro. '
-                'All animations, music and the Aspirex logo are kept intact.</div>',
-                unsafe_allow_html=True)
-            st.write("")
-            col1, col2, col3 = st.columns(3)
-            pend = c["Queued"] + c["Failed"]
-            with col1:
-                go = st.button("▶ Start / resume", type="primary",
-                               use_container_width=True,
-                               disabled=(pend == 0 or not logo))
-            with col2:
-                if st.button("↩ Retry failed", use_container_width=True,
-                             disabled=c["Failed"]==0):
-                    for j in st.session_state.jobs:
-                        if j["status"]=="Failed": requeue(j)
-                    st.rerun()
-            with col3:
-                if st.button("🗑 Clear all", use_container_width=True,
-                             disabled=c["Total"]==0):
-                    st.session_state.jobs.clear(); st.rerun()
+        t1, t2 = st.columns(2)
+        with t1:
+            trim_start = st.number_input("Remove from start (s)", 0.0, 300.0, 9.0, 0.5, "%.1f",
+                                          help="Seconds of the old SLC intro to cut.")
+        with t2:
+            outro_remove = st.number_input("Remove from end (s)", 0.0, 300.0, 10.0, 0.5, "%.1f",
+                                            help="Seconds of the old SLC outro to cut.")
 
-            if go and logo:
-                run_queue(brand, logo, trim_start, outro_remove, speed)
-
-        with st.container(border=True):
-            st.subheader("3 · Intro preview")
-            st.caption("Shows the real intro video with your text applied.")
-            first = st.session_state.jobs[0] if st.session_state.jobs else {}
-            prev = make_preview(brand,
-                                first.get("course", default_course),
-                                first.get("unit",   default_unit),
-                                first.get("chapter",default_chapter))
-            if prev:
-                st.image(prev, use_container_width=True,
-                         caption="Real intro + your text overlay")
+        if uploaded and st.button("👁 Preview trim points", use_container_width=True):
+            with st.spinner("Grabbing frames…"):
+                first, last, src_dur = trim_preview(uploaded, trim_start, outro_remove)
+            if trim_start + outro_remove >= src_dur:
+                st.error(f"Trim removes the entire video (source is only {fmt_time(src_dur)}).")
             else:
-                st.info("Intro.mp4 not found or no videos added yet.")
+                p1, p2 = st.columns(2)
+                with p1:
+                    if first is not None:
+                        st.image(first, use_container_width=True,
+                                 caption=f"First kept frame @ {fmt_time(trim_start)}")
+                    else:
+                        st.warning("Couldn't read that frame.")
+                with p2:
+                    if last is not None:
+                        st.image(last, use_container_width=True,
+                                 caption=f"Last kept frame @ {fmt_time(src_dur - outro_remove)}")
+                    else:
+                        st.warning("Couldn't read that frame.")
+                st.caption(f"Source duration: {fmt_time(src_dur)}. If the \"last kept frame\" "
+                           "still shows real lesson content (not the old outro), lower "
+                           "\"Remove from end\".")
 
-    # ── RIGHT COLUMN ──────────────────────────
-    with right:
-        with st.container(border=True):
-            st.subheader("Queue")
-            rows = [{"#":i+1,"File":j["name"],"Unit":j["unit"],
-                     "Chapter":j["chapter"],"Status":j["status"],
-                     "Size":j["size"]}
-                    for i,j in enumerate(st.session_state.jobs)]
-            if rows:
-                st.dataframe(rows, use_container_width=True, hide_index=True)
-            else:
-                st.info("No videos yet — add some on the left.")
+    # ── 4 · Process ────────────────────────────
+    with st.container(border=True):
+        st.subheader("4 · Process")
+        st.markdown(
+            f'<div class="info-box">The exact <b>Intro.mp4</b> is used. '
+            f'Only the course name, unit number and chapter name are replaced in the intro. '
+            f'All animations, music and the {brand} logo are kept intact.</div>',
+            unsafe_allow_html=True)
+        st.write("")
 
-        with st.container(border=True):
-            st.subheader("Edit each video")
-            if not st.session_state.jobs:
-                st.info("Queue is empty.")
-            else:
-                ac1, ac2 = st.columns(2)
-                with ac1:
-                    auto_start = st.number_input("Auto-number from", 1, 999, 1, 1)
-                with ac2:
-                    if st.button("Auto-number units", use_container_width=True):
-                        for n, j in enumerate(st.session_state.jobs, int(auto_start)):
-                            old = j["unit"]
-                            j["unit"] = f"UNIT {n:02d}"
-                            if j["status"]=="Done" and j["unit"]!=old: requeue(j)
-                        st.success("Units renumbered.")
+        default_stem = Path(uploaded.name).stem if uploaded else "output"
+        out_name_raw = st.text_input("Output filename", f"{default_stem}_{brand.lower()}_rebranded.mp4"
+                                      if uploaded else "")
+        out_name = safe_name(out_name_raw, default_stem, brand)
 
-                for i, job in enumerate(st.session_state.jobs, 1):
-                    status = job["status"]
-                    with st.expander(f"{i}. {job['name']}  —  {status}",
-                                     expanded=(i==1 and status!="Done")):
-                        st.markdown(badge(status), unsafe_allow_html=True)
-                        st.caption(f"Input: {job['size']}")
+        go = st.button("▶ Process video", type="primary", use_container_width=True,
+                        disabled=not (uploaded and logo))
 
-                        old = (job["course"], job["unit"], job["chapter"], job["out_name"])
+        if go and uploaded and logo:
+            st.session_state.result_path = None
+            st.session_state.result_error = None
+            try:
+                with st.spinner("Processing… this can take a minute for longer videos."):
+                    dest = run_single(uploaded, brand, logo, course, unit, chapter,
+                                       out_name, trim_start, outro_remove, speed)
+                st.session_state.result_path = str(dest)
+            except Exception as e:
+                st.session_state.result_error = str(e)
 
-                        course  = st.text_input("Course name",   job["course"],  key=f"c_{job['id']}")
-                        u1, u2  = st.columns([.35, .65])
-                        with u1:
-                            unit = st.text_input("Unit number", job["unit"],    key=f"u_{job['id']}")
-                        with u2:
-                            chap = st.text_input("Chapter name", job["chapter"], key=f"ch_{job['id']}")
-                        oname = st.text_input("Output filename", job["out_name"], key=f"o_{job['id']}")
+        if st.session_state.result_error:
+            st.error(st.session_state.result_error)
 
-                        new_oname = safe_name(oname, Path(job["name"]).stem, brand)
-                        new = (course, unit, chap, new_oname)
-                        if new != old and status == "Done": requeue(job)
-                        job["course"], job["unit"], job["chapter"], job["out_name"] = new
-
-                        b1, b2, b3 = st.columns(3)
-                        with b1:
-                            if st.button("Remove", key=f"rm_{job['id']}",
-                                         use_container_width=True,
-                                         disabled=status=="Processing"):
-                                st.session_state.jobs = [
-                                    j for j in st.session_state.jobs if j["id"]!=job["id"]]
-                                st.rerun()
-                        with b2:
-                            if st.button("Requeue", key=f"rq_{job['id']}",
-                                         use_container_width=True,
-                                         disabled=status=="Processing"):
-                                requeue(job); st.success("Requeued.")
-                        with b3:
-                            op = Path(job["output"]) if job["output"] else None
-                            can_dl = status=="Done" and op and op.exists()
-                            if can_dl:
-                                st.download_button("⬇ Download",
-                                                   data=op.read_bytes(),
-                                                   file_name=Path(job["out_name"]).name,
-                                                   mime="video/mp4",
-                                                   key=f"dl_{job['id']}",
-                                                   use_container_width=True)
-                            else:
-                                st.button("Download", disabled=True,
-                                          key=f"dl_dis_{job['id']}",
-                                          use_container_width=True)
-
-                        if status=="Done":
-                            st.success(f"Ready · {job['file_size']} · {job['dur']}")
-                        if status=="Failed":
-                            st.error(job["error"])
-
-        with st.container(border=True):
-            st.subheader("Download all")
-            done = [j for j in st.session_state.jobs
-                    if j["status"]=="Done" and j["output"]
-                    and Path(j["output"]).exists()]
-            if done:
-                zb = build_zip(brand)
-                st.download_button("⬇ Download all as ZIP",
-                                   data=zb,
-                                   file_name=f"{brand.lower()}_rebranded_videos.zip",
-                                   mime="application/zip",
-                                   type="primary",
-                                   use_container_width=True)
-                st.caption(f"{len(done)} video(s) ready.")
-            else:
-                st.info("Completed videos will appear here.")
+        if st.session_state.result_path and Path(st.session_state.result_path).exists():
+            p = Path(st.session_state.result_path)
+            dur, _, _, _ = get_media_info(p)
+            st.success(f"Ready · {p.stat().st_size/1_048_576:.1f} MB · {fmt_time(dur)}")
+            st.download_button("⬇ Download", data=p.read_bytes(), file_name=p.name,
+                                mime="video/mp4", type="primary", use_container_width=True)
 
 
 if __name__ == "__main__":
