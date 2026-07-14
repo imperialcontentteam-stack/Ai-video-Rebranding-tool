@@ -24,6 +24,7 @@ import tempfile
 import threading
 import time
 import uuid
+import warnings
 from pathlib import Path
 from typing import Callable, Optional, Tuple
 
@@ -242,15 +243,13 @@ def make_font(size: int, bold: bool = True):
         return ImageFont.truetype(fp, size)
     if not _FONT_FALLBACK_WARNED:
         _FONT_FALLBACK_WARNED = True
-        try:
-            st.error(
-                "⚠ Poppins-Bold.ttf was not found next to app.py and no system "
-                "font was found either. Falling back to a tiny placeholder font — "
-                "title/pill text will look wrong. Make sure Poppins-Bold.ttf ships "
-                "in the same folder as app.py."
-            )
-        except Exception:
-            pass
+        warnings.warn(
+            "Poppins-Bold.ttf was not found next to app.py and no system font "
+            "was found either. Falling back to a small placeholder font; title "
+            "and pill text may look wrong.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     return ImageFont.load_default()
 
 def tsz(draw, text: str, font) -> Tuple[int, int]:
@@ -664,23 +663,28 @@ def fmt_time(s: float) -> str:
 # ─────────────────────────────────────────────
 #  Caching (speed optimization)
 # ─────────────────────────────────────────────
-def _cache_dir() -> Path:
-    d = Path(st.session_state.out_dir) / "_cache"
-    d.mkdir(exist_ok=True)
+def _cache_dir(out_root: Path) -> Path:
+    """Return the cache folder without reading Streamlit session state.
+
+    Passing ordinary Path objects keeps this helper safe when it is called by
+    background worker threads, which do not own Streamlit's script context.
+    """
+    d = Path(out_root) / "_cache"
+    d.mkdir(parents=True, exist_ok=True)
     return d
 
-def upload_cache_path(uploaded) -> Path:
+def upload_cache_path(uploaded, cache_dir: Path) -> Path:
     key = hashlib.sha1(f"{uploaded.name}|{uploaded.size}".encode()).hexdigest()[:16]
-    p = _cache_dir() / f"{key}.mp4"
+    p = Path(cache_dir) / f"{key}.mp4"
     if not p.exists():
         p.write_bytes(uploaded.getvalue())
     return p
 
-def cached_outro(brand: str, speed: str, logo: Path) -> Path:
+def cached_outro(brand: str, speed: str, logo: Path, cache_dir: Path) -> Path:
     """Build the normalized outro once per (brand, speed) and reuse it across
     every job in the queue — previously it was rebuilt for every video."""
     slug = re.sub(r"[^a-z0-9]+", "", speed.lower())
-    p = _cache_dir() / f"outro_{BRANDS[brand]['prefix']}_{slug}.mp4"
+    p = Path(cache_dir) / f"outro_{BRANDS[brand]['prefix']}_{slug}.mp4"
     if p.exists() and p.stat().st_size > 0:
         return p
     with tempfile.TemporaryDirectory() as tmp:
@@ -693,12 +697,13 @@ def cached_outro(brand: str, speed: str, logo: Path) -> Path:
         normalize_clip(raw, p, speed)
     return p
 
-def cached_intro(brand: str, course: str, unit: str, chapter: str, speed: str) -> Path:
+def cached_intro(brand: str, course: str, unit: str, chapter: str, speed: str,
+                 cache_dir: Path) -> Path:
     """Generate the branded intro once per unique text/brand/speed combination.
     Repeated runs (or many chapters of the same course) reuse it instantly."""
     key = hashlib.sha1(f"{brand}|{course.strip().upper()}|{unit.strip().upper()}|"
                        f"{chapter.strip().upper()}|{speed}".encode()).hexdigest()[:16]
-    p = _cache_dir() / f"intro_{key}.mp4"
+    p = Path(cache_dir) / f"intro_{key}.mp4"
     if p.exists() and p.stat().st_size > 0:
         return p
     tmp = p.with_suffix(".building.mp4")
@@ -759,11 +764,14 @@ def new_job(src_path: Path, src_name: str, brand: str, course: str, unit: str,
     }
 
 
-def run_job(job: dict, on_update: Callable[[], None]) -> None:
+def run_job(job: dict, on_update: Callable[[], None], out_root: Path) -> None:
     """Process one queue job with live progress. Speed optimizations:
     the outro is cached per brand, the intro is cached per unique text and
     generated in PARALLEL with the (much longer) content encode."""
     t_start = time.time()
+    out_root = Path(out_root)
+    cache_dir = _cache_dir(out_root)
+
     logo = _logo_path(job["brand"])
     if not logo:
         raise FileNotFoundError(f"Missing logo: {BRANDS[job['brand']]['logo']}")
@@ -774,7 +782,7 @@ def run_job(job: dict, on_update: Callable[[], None]) -> None:
         on_update()
 
     setp(0.02, "Preparing outro")
-    outro = cached_outro(job["brand"], job["speed"], logo)
+    outro = cached_outro(job["brand"], job["speed"], logo, cache_dir)
 
     src = Path(job["src"])
     info = get_media_info(src)
@@ -795,7 +803,7 @@ def run_job(job: dict, on_update: Callable[[], None]) -> None:
             try:
                 intro_result["path"] = cached_intro(
                     job["brand"], job["course"], job["unit"],
-                    job["chapter"], job["speed"])
+                    job["chapter"], job["speed"], cache_dir)
             except Exception as e:  # surfaced after join
                 intro_result["error"] = e
         it = threading.Thread(target=_intro_worker, daemon=True)
@@ -818,8 +826,8 @@ def run_job(job: dict, on_update: Callable[[], None]) -> None:
         if not final.exists() or final.stat().st_size == 0:
             raise RuntimeError("Output file not created.")
 
-        out_dir = Path(st.session_state.out_dir) / "results"
-        out_dir.mkdir(exist_ok=True)
+        out_dir = out_root / "results"
+        out_dir.mkdir(parents=True, exist_ok=True)
         dest = out_dir / f"{job['id']}_{job['out_name']}"
         shutil.copy(final, dest)
         job["result"] = str(dest)
@@ -928,7 +936,7 @@ def setup_page():
 
 def init_state():
     if "out_dir" not in st.session_state:
-        st.session_state.out_dir = tempfile.mkdtemp(prefix="rebrand_")
+        st.session_state["out_dir"] = tempfile.mkdtemp(prefix="rebrand_")
     if "queue" not in st.session_state:
         st.session_state.queue = []          # list[dict] job records
     if "queue_running" not in st.session_state:
@@ -992,6 +1000,9 @@ def render_job_card(job: dict, live: bool = False):
 
 def process_queue():
     """Run all pending jobs sequentially with live in-place progress updates."""
+    # Read session state only in Streamlit's main script thread. The resulting
+    # normal Path is then passed through the processing pipeline explicitly.
+    out_root = Path(st.session_state["out_dir"])
     pending = [j for j in st.session_state.queue if j["status"] == STATUS_PENDING]
     if not pending:
         return
@@ -1015,7 +1026,7 @@ def process_queue():
                 sp.caption(f"{j['stage']} — {int(j['progress']*100)}%")
 
             try:
-                run_job(job, on_update)
+                run_job(job, on_update, out_root)
                 job["status"] = STATUS_DONE
                 chip_ph.markdown(CHIP[STATUS_DONE], unsafe_allow_html=True)
                 prog_ph.progress(1.0)
@@ -1036,6 +1047,9 @@ def main():
         get_ffmpeg()
     except RuntimeError as e:
         st.error(str(e)); st.stop()
+
+    session_out_dir = Path(st.session_state["out_dir"])
+    cache_dir = _cache_dir(session_out_dir)
 
     st.markdown("""
 <div class="hero">
@@ -1115,7 +1129,7 @@ def main():
 
         if uploads and st.button("👁 Preview trim points (first video)", use_container_width=True):
             with st.spinner("Grabbing frames…"):
-                src0 = upload_cache_path(uploads[0])
+                src0 = upload_cache_path(uploads[0], cache_dir)
                 first, last, src_dur = trim_preview(src0, trim_start, outro_remove)
             if trim_start + outro_remove >= src_dur:
                 st.error(f"Trim removes the entire video (source is only {fmt_time(src_dur)}).")
@@ -1159,7 +1173,7 @@ def main():
                         disabled=not (uploads and logo and intro))
         if add and uploads:
             for up in uploads:
-                src = upload_cache_path(up)
+                src = upload_cache_path(up, cache_dir)
                 stem = Path(up.name).stem
                 if len(uploads) == 1 and custom_name:
                     out_name = safe_name(custom_name, stem, brand)
