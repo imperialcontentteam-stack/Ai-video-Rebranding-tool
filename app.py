@@ -96,8 +96,8 @@ TITLE_MASK_ROI = (230, 320, 1690, 590)  # x1, y1, x2, y2
 
 INTRO_RENDER_VERSION = "feathered-clean-patches-with-pill-v3"
 
-SLC_COVER_BOX = (1688, 938, 190, 142)  # larger area that fully hides the old SLC logo
-SLC_LOGO_BOX  = (1722, 966, 106, 60)   # position and size of the replacement logo
+SLC_COVER_BOX = (1688, 972, 160, 82)   # cleanup stays inside the existing rounded white pill
+SLC_LOGO_BOX  = (1722, 983, 106, 60)   # unchanged maximum logo size; centered in the pill
 
 # ─────────────────────────────────────────────
 #  Brand config
@@ -670,8 +670,9 @@ def process_content(src: Path, out: Path, media_info, trim_start: float,
     fc = (
         f"[0:v]{scale_filter()},"
         f"drawbox=x={cx}:y={cy}:w={cw}:h={ch}:color={cover}:t=fill,format=rgba[base];"
-        f"[1:v]format=rgba,scale={w}:{h}:flags=lanczos[logo];"
-        f"[base][logo]overlay=x={x}:y={y}:format=auto,format=yuv420p[v]"
+        f"[1:v]format=rgba,scale={w}:{h}:force_original_aspect_ratio=decrease:flags=lanczos[logo];"
+        f"[base][logo]overlay=x={x}+({w}-overlay_w)/2:y={y}+({h}-overlay_h)/2:"
+        f"format=auto,format=yuv420p[v]"
     )
     cmd = ["ffmpeg", "-y", "-hide_banner",
            "-accurate_seek", "-ss", f"{trim_start:.3f}", "-t", f"{seg:.3f}",
