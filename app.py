@@ -87,7 +87,8 @@ PILL_FADE_DUR    = 0.10
 TITLE_BG_HEX  = "9B5EE1"
 PILL_BG_HEX   = "945BE1"
 
-SLC_LOGO_BOX  = (1722, 966, 106, 60)
+SLC_COVER_BOX = (1688, 938, 190, 142)  # larger area that fully hides the old SLC logo
+SLC_LOGO_BOX  = (1722, 966, 106, 60)   # position and size of the replacement logo
 
 # ─────────────────────────────────────────────
 #  Brand config
@@ -573,11 +574,12 @@ def process_content(src: Path, out: Path, media_info, trim_start: float,
     seg = trim_end - trim_start
     if seg <= 0:
         raise ValueError("Trim settings leave no content.")
+    cx, cy, cw, ch = SLC_COVER_BOX
     x, y, w, h = SLC_LOGO_BOX
-    cover = "0xFFFFFF@1.0"
+    cover = "0xFAFAFA@1.0"
     fc = (
         f"[0:v]{scale_filter()},"
-        f"drawbox=x={x}:y={y}:w={w}:h={h}:color={cover}:t=fill,format=rgba[base];"
+        f"drawbox=x={cx}:y={cy}:w={cw}:h={ch}:color={cover}:t=fill,format=rgba[base];"
         f"[1:v]format=rgba,scale={w}:{h}:flags=lanczos[logo];"
         f"[base][logo]overlay=x={x}:y={y}:format=auto,format=yuv420p[v]"
     )
