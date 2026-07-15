@@ -1,7 +1,11 @@
 """
-Video Rebranding Tool v17
+Video Rebranding Tool v17.1 Cloud Safe
 Uses the EXACT uploaded Intro.mp4 — only changes the course name, unit number and chapter name.
 All animations, logo, 3D shapes and audio are preserved perfectly.
+
+v17.1 cloud-safety changes:
+ 0. Streamlit Community Cloud-safe FFmpeg execution: one encode at a time,
+    one encoder/filter thread, deferred downloads and streamed upload copies.
 
 v17 changes:
  1. Full course name always displayed — text wraps up to 4 lines and auto-shrinks;
@@ -21,7 +25,6 @@ import re
 import shutil
 import subprocess
 import tempfile
-import threading
 import time
 import uuid
 import warnings
@@ -40,6 +43,15 @@ TARGET_W   = 1920
 TARGET_H   = 1080
 TARGET_FPS = 30
 AUDIO_RATE = 48000
+
+# Community Cloud has limited shared CPU/RAM. Using all available FFmpeg
+# threads and running two 1080p encodes at once can cause the app process to
+# be killed, which appears in the logs as a /healthz connection reset.
+# Set FFMPEG_THREADS=2 or higher only on a larger private server.
+try:
+    FFMPEG_THREADS = max(1, int(os.environ.get("FFMPEG_THREADS", "1")))
+except ValueError:
+    FFMPEG_THREADS = 1
 
 # ─────────────────────────────────────────────
 #  Pixel-measured regions in Intro.mp4
@@ -141,7 +153,12 @@ def _test_exe(path: str) -> bool:
 
 def ff(cmd: list[str]) -> list[str]:
     if cmd and cmd[0] == "ffmpeg":
-        return [get_ffmpeg(), *cmd[1:]]
+        return [
+            get_ffmpeg(),
+            "-filter_threads", str(FFMPEG_THREADS),
+            "-filter_complex_threads", str(FFMPEG_THREADS),
+            *cmd[1:],
+        ]
     return cmd
 
 def run(cmd: list[str], label: str) -> None:
@@ -157,22 +174,36 @@ def run_progress(cmd: list[str], label: str, total_dur: float,
         return
     full = ff(cmd)
     full = [full[0], "-progress", "pipe:1", "-nostats", *full[1:]]
-    p = subprocess.Popen(full, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                         text=True, bufsize=1)
-    try:
-        assert p.stdout is not None
-        for line in p.stdout:
-            line = line.strip()
-            if line.startswith("out_time_ms=") or line.startswith("out_time_us="):
-                val = line.split("=", 1)[1]
-                if val.isdigit():
-                    try:
-                        cb(min(int(val) / 1_000_000.0 / total_dur, 1.0))
-                    except Exception:
-                        pass
-    finally:
-        err = p.stderr.read() if p.stderr else ""
-        p.wait()
+
+    # Do not leave stderr unread in a PIPE while FFmpeg runs. A full pipe can
+    # block FFmpeg indefinitely. A temporary disk-backed log also keeps long
+    # encodes from accumulating log output in RAM.
+    with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as err_file:
+        p = subprocess.Popen(
+            full,
+            stdout=subprocess.PIPE,
+            stderr=err_file,
+            text=True,
+            bufsize=1,
+        )
+        try:
+            assert p.stdout is not None
+            for line in p.stdout:
+                line = line.strip()
+                if line.startswith("out_time_ms=") or line.startswith("out_time_us="):
+                    val = line.split("=", 1)[1]
+                    if val.isdigit():
+                        try:
+                            cb(min(int(val) / 1_000_000.0 / total_dur, 1.0))
+                        except Exception:
+                            pass
+        finally:
+            if p.stdout is not None:
+                p.stdout.close()
+            p.wait()
+            err_file.seek(0)
+            err = err_file.read()
+
     if p.returncode != 0:
         raise RuntimeError(f"{label} failed.\n\n{(err or '')[-4000:]}")
 
@@ -206,7 +237,7 @@ def get_media_info(path: Path) -> tuple[float, int, int, bool]:
 def enc_args(speed: str, crf: Optional[int] = None) -> list[str]:
     p = SPEED_PROFILES.get(speed, SPEED_PROFILES[DEFAULT_SPEED])
     return ["-c:v", "libx264", "-preset", p["preset"], "-crf", str(crf or p["crf"]),
-            "-threads", "0"]
+            "-threads", str(FFMPEG_THREADS)]
 
 def scale_filter() -> str:
     return (f"scale={TARGET_W}:{TARGET_H}:force_original_aspect_ratio=decrease,"
@@ -677,7 +708,10 @@ def upload_cache_path(uploaded, cache_dir: Path) -> Path:
     key = hashlib.sha1(f"{uploaded.name}|{uploaded.size}".encode()).hexdigest()[:16]
     p = Path(cache_dir) / f"{key}.mp4"
     if not p.exists():
-        p.write_bytes(uploaded.getvalue())
+        uploaded.seek(0)
+        with p.open("wb") as dst:
+            shutil.copyfileobj(uploaded, dst, length=1024 * 1024)
+        uploaded.seek(0)
     return p
 
 def cached_outro(brand: str, speed: str, logo: Path, cache_dir: Path) -> Path:
@@ -765,9 +799,12 @@ def new_job(src_path: Path, src_name: str, brand: str, course: str, unit: str,
 
 
 def run_job(job: dict, on_update: Callable[[], None], out_root: Path) -> None:
-    """Process one queue job with live progress. Speed optimizations:
-    the outro is cached per brand, the intro is cached per unique text and
-    generated in PARALLEL with the (much longer) content encode."""
+    """Process one queue job with live progress.
+
+    Intro, lesson and outro preparation is deliberately sequential. Running
+    the intro and lesson encoders in parallel can exceed Streamlit Community
+    Cloud's shared CPU/RAM limits and terminate the entire app process.
+    """
     t_start = time.time()
     out_root = Path(out_root)
     cache_dir = _cache_dir(out_root)
@@ -797,28 +834,18 @@ def run_job(job: dict, on_update: Callable[[], None], out_root: Path) -> None:
     with tempfile.TemporaryDirectory() as tmp:
         tmpdir = Path(tmp)
 
-        # Kick the intro off in a background thread while the content encodes.
-        intro_result: dict = {}
-        def _intro_worker():
-            try:
-                intro_result["path"] = cached_intro(
-                    job["brand"], job["course"], job["unit"],
-                    job["chapter"], job["speed"], cache_dir)
-            except Exception as e:  # surfaced after join
-                intro_result["error"] = e
-        it = threading.Thread(target=_intro_worker, daemon=True)
-        it.start()
+        setp(0.05, "Preparing intro")
+        intro_clip = cached_intro(
+            job["brand"], job["course"], job["unit"],
+            job["chapter"], job["speed"], cache_dir
+        )
 
-        setp(0.05, "Rebranding lesson video")
+        setp(0.12, "Rebranding lesson video")
         content_out = tmpdir / "content.mp4"
-        process_content(src, content_out, info, t0, t1, logo, job["speed"],
-                        cb=lambda f: setp(0.05 + f * 0.78, "Rebranding lesson video"))
-
-        setp(0.85, "Finalising intro")
-        it.join()
-        if "error" in intro_result:
-            raise intro_result["error"]
-        intro_clip = intro_result["path"]
+        process_content(
+            src, content_out, info, t0, t1, logo, job["speed"],
+            cb=lambda f: setp(0.12 + f * 0.75, "Rebranding lesson video"),
+        )
 
         setp(0.90, "Stitching intro + lesson + outro")
         final = tmpdir / job["out_name"]
@@ -981,14 +1008,23 @@ def render_job_card(job: dict, live: bool = False):
             dur, _, _, _ = get_media_info(p)
             took = f" · finished in {job['elapsed']:.0f}s" if job.get("elapsed") else ""
             stage_ph.caption(f"{p.stat().st_size/1_048_576:.1f} MB · {fmt_time(dur)}{took}")
-            st.download_button("⬇ Download video", data=p.read_bytes(),
-                               file_name=job["out_name"], mime="video/mp4",
-                               type="primary", use_container_width=True,
-                               key=f"dl_{job['id']}")
+            def open_result(path=p):
+                return path.open("rb")
+
+            st.download_button(
+                "⬇ Download video",
+                data=open_result,
+                file_name=job["out_name"],
+                mime="video/mp4",
+                type="primary",
+                width="stretch",
+                on_click="ignore",
+                key=f"dl_{job['id']}",
+            )
 
         # Remove button (not while processing)
         if job["status"] in (STATUS_PENDING, STATUS_DONE, STATUS_ERROR) and not live:
-            if st.button("Remove", key=f"rm_{job['id']}", use_container_width=True):
+            if st.button("Remove", key=f"rm_{job['id']}", width="stretch"):
                 if job.get("result"):
                     Path(job["result"]).unlink(missing_ok=True)
                 st.session_state.queue = [j for j in st.session_state.queue
@@ -1053,11 +1089,11 @@ def main():
 
     st.markdown("""
 <div class="hero">
-  <span class="badge">v17 · Queue Edition</span>
+  <span class="badge">v17.1 · Cloud-Safe Queue</span>
   <h1>🎬 Video Rebranding Studio</h1>
   <p>Replace the course name, unit and chapter in your exact Intro.mp4 — every
   animation, logo and note of music kept intact. Queue up multiple videos and
-  download each finished MP4 directly.</p>
+  download each finished MP4 directly. Cloud-safe mode processes only one FFmpeg encode at a time.</p>
 </div>""", unsafe_allow_html=True)
 
     # ── Sidebar ───────────────────────────────
@@ -1089,6 +1125,7 @@ def main():
         fp = find_font()
         st.caption(f"Font: {Path(fp).name if fp else 'PIL default'}")
         st.caption(f"FFmpeg: {Path(get_ffmpeg()).name}")
+        st.caption(f"FFmpeg threads: {FFMPEG_THREADS} (cloud-safe)")
 
     # ── 1 · Video details ─────────────────────
     with st.container(border=True):
@@ -1108,7 +1145,7 @@ def main():
                    "Long course names wrap onto multiple lines, never cut off.")
         prev = make_preview(brand, course, unit, chapter)
         if prev:
-            st.image(prev, use_container_width=True)
+            st.image(prev, width="stretch")
         else:
             st.info("Intro.mp4 not found.")
 
@@ -1127,7 +1164,7 @@ def main():
             outro_remove = st.number_input("Remove from end (s)", 0.0, 300.0, 10.0, 0.5, "%.1f",
                                             help="Seconds of the old SLC outro to cut.")
 
-        if uploads and st.button("👁 Preview trim points (first video)", use_container_width=True):
+        if uploads and st.button("👁 Preview trim points (first video)", width="stretch"):
             with st.spinner("Grabbing frames…"):
                 src0 = upload_cache_path(uploads[0], cache_dir)
                 first, last, src_dur = trim_preview(src0, trim_start, outro_remove)
@@ -1137,13 +1174,13 @@ def main():
                 p1, p2 = st.columns(2)
                 with p1:
                     if first is not None:
-                        st.image(first, use_container_width=True,
+                        st.image(first, width="stretch",
                                  caption=f"First kept frame @ {fmt_time(trim_start)}")
                     else:
                         st.warning("Couldn't read that frame.")
                 with p2:
                     if last is not None:
-                        st.image(last, use_container_width=True,
+                        st.image(last, width="stretch",
                                  caption=f"Last kept frame @ {fmt_time(src_dur - outro_remove)}")
                     else:
                         st.warning("Couldn't read that frame.")
@@ -1169,7 +1206,7 @@ def main():
 
         n = len(uploads) if uploads else 0
         add = st.button(f"➕ Add {n or ''} video{'s' if n != 1 else ''} to queue".replace("  ", " "),
-                        type="primary", use_container_width=True,
+                        type="primary", width="stretch",
                         disabled=not (uploads and logo and intro))
         if add and uploads:
             for up in uploads:
@@ -1205,9 +1242,9 @@ def main():
             b1, b2 = st.columns([2, 1])
             with b1:
                 start = st.button(f"▶ Start queue ({n_pend} pending)", type="primary",
-                                  use_container_width=True, disabled=n_pend == 0)
+                                  width="stretch", disabled=n_pend == 0)
             with b2:
-                if st.button("🧹 Clear finished", use_container_width=True,
+                if st.button("🧹 Clear finished", width="stretch",
                              disabled=(n_done + n_err) == 0):
                     for j in q:
                         if j["status"] in (STATUS_DONE, STATUS_ERROR) and j.get("result"):
