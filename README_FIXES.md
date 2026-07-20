@@ -21,3 +21,10 @@ streamlit run app.py
 ```
 
 Keep `app.py`, the MP4 assets, logo PNG files and `Poppins-Bold.ttf` in the same folder.
+
+## v17.2 unit/chapter timing fix
+- The clean title layer now appears before the source title animation begins.
+- The clean pill layer now appears before the source `UNIT 01 - CHAPTER 01` animation begins, preventing a brief incorrect-number flash.
+- The intro cache version was increased so old cached clips cannot be reused.
+- When untouched default fields are left in place, common filenames such as `... Unit 7 chapter 5.mp4` are used as a safeguard for the queued job.
+- Queue jobs still preserve the values captured when they are added. Delete and re-add an old pending job after changing its details.

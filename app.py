@@ -1,7 +1,12 @@
 """
-Video Rebranding Tool v17.1 Cloud Safe
+Video Rebranding Tool v17.2 Cloud Safe
 Uses the EXACT uploaded Intro.mp4 — only changes the course name, unit number and chapter name.
 All animations, logo, 3D shapes and audio are preserved perfectly.
+
+v17.2 fixes:
+ 0. Prevents the source Unit 01 / Chapter 01 wording from flashing before the replacement.
+ 1. Invalidates older cached intros after timing fixes.
+ 2. Detects unit/chapter metadata from common lesson filenames when the default UI values were left unchanged.
 
 v17.1 cloud-safety changes:
  0. Streamlit Community Cloud-safe FFmpeg execution: one encode at a time,
@@ -85,6 +90,14 @@ TITLE_FADE_DUR   = 0.30
 PILL_FADE_START  = 1.90
 PILL_FADE_DUR    = 0.10
 
+# The placeholder wording baked into the source intro starts appearing before
+# the replacement text.  The cleaning layers must therefore be fully visible
+# before the original title/pill animations begin.  Keeping these timings
+# separate from the replacement fade timings prevents the old UNIT 01 /
+# CHAPTER 01 wording from flashing for a few frames.
+TITLE_CLEAN_START = 0.62
+PILL_CLEAN_START  = 1.52
+
 TITLE_BG_HEX  = "9B5EE1"
 PILL_BG_HEX   = "945BE1"
 
@@ -94,7 +107,7 @@ CLEAN_PATCH_TIME_MS = 750
 MASK_REFERENCE_TIME_MS = 8500
 TITLE_MASK_ROI = (230, 320, 1690, 590)  # x1, y1, x2, y2
 
-INTRO_RENDER_VERSION = "original-white-purple-style-v4"
+INTRO_RENDER_VERSION = "original-white-purple-style-v5-no-placeholder-flash"
 
 # The source intro uses a white course title, a soft blurred shadow and a
 # white unit/chapter pill with purple text. These values reproduce that visual
@@ -747,8 +760,11 @@ def generate_intro_clip(out_path: Path, brand: str, course: str, unit_no: str,
         unit_text.save(paths["unit_text"])
         build_intro_logo_layer(brand).save(paths["brand_logo"])
 
-        title_clean_start = max(TITLE_FADE_START - ERASE_LEAD, 0.0)
-        pill_clean_start = max(PILL_FADE_START - ERASE_LEAD, 0.0)
+        # Hide the source placeholder wording before it begins animating.
+        # Previously these were derived from the replacement fade times, which
+        # allowed the baked-in UNIT 01 / CHAPTER 01 pill to appear briefly.
+        title_clean_start = max(TITLE_CLEAN_START, 0.0)
+        pill_clean_start = max(PILL_CLEAN_START, 0.0)
         dlx, dly, dlw, dlh = INTRO_LOGO_DELOGO
         vf = (
             f"[0:v]{scale_filter()},delogo=x={dlx}:y={dly}:w={dlw}:h={dlh}:show=0[base];"
@@ -912,6 +928,62 @@ def _outro_path(brand: str) -> Optional[Path]:
 def _logo_path(brand: str) -> Optional[Path]:
     p = _base() / BRANDS[brand]["logo"]
     return p if p.exists() else None
+
+DEFAULT_COURSE_NAME = "LEVEL 4 DIPLOMA IN EDUCATION STUDIES (RQF)"
+DEFAULT_UNIT_NUMBER = "UNIT 01"
+DEFAULT_CHAPTER_NAME = "CHAPTER 01"
+
+
+def infer_intro_fields_from_filename(filename: str) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """Read common lesson naming such as
+    'Level 3 Diploma ... Unit 7 chapter 5.mp4'.
+
+    This is only used as a safeguard when the corresponding UI field still
+    contains its untouched default value. Explicit user-entered values always
+    take priority.
+    """
+    stem = Path(filename or "").stem
+    match = re.search(
+        r"(?is)^\s*(.*?)\s+unit\s*[-_:]?\s*(\d+)\s+chapter\s*[-_:]?\s*(\d+)\s*$",
+        stem,
+    )
+    if not match:
+        return None, None, None
+
+    course_raw, unit_digits, chapter_digits = match.groups()
+    course = re.sub(r"[_\s]+", " ", course_raw).strip(" -_")
+    # Normalise a filename fragment such as "RQF" or "_RQF_" to the visual
+    # form normally used in the intro title.
+    course = re.sub(r"(?i)\bRQF\b", "(RQF)", course)
+    course = re.sub(r"\(\s*\(RQF\)\s*\)", "(RQF)", course)
+    course = re.sub(r"\s+", " ", course).strip()
+
+    unit_value = f"UNIT {int(unit_digits):02d}"
+    chapter_value = f"CHAPTER {int(chapter_digits):02d}"
+    return (course.upper() if course else None), unit_value, chapter_value
+
+
+def resolve_intro_fields_for_job(
+    filename: str,
+    course: str,
+    unit: str,
+    chapter: str,
+) -> tuple[str, str, str]:
+    """Protect queued jobs from accidentally retaining untouched defaults."""
+    inferred_course, inferred_unit, inferred_chapter = infer_intro_fields_from_filename(filename)
+    resolved_course = (course or "").strip()
+    resolved_unit = (unit or "").strip()
+    resolved_chapter = (chapter or "").strip()
+
+    if inferred_course and resolved_course.upper() == DEFAULT_COURSE_NAME:
+        resolved_course = inferred_course
+    if inferred_unit and resolved_unit.upper() == DEFAULT_UNIT_NUMBER:
+        resolved_unit = inferred_unit
+    if inferred_chapter and resolved_chapter.upper() == DEFAULT_CHAPTER_NAME:
+        resolved_chapter = inferred_chapter
+
+    return resolved_course, resolved_unit, resolved_chapter
+
 
 def safe_name(v: str, stem: str, brand: str) -> str:
     raw = (v or "").strip() or f"{stem}_{brand.lower()}_rebranded.mp4"
@@ -2061,9 +2133,9 @@ def _workflow_states(brand: str) -> list[str]:
     details_done = all(
         str(st.session_state.get(key, default)).strip()
         for key, default in (
-            ("course_name", "LEVEL 4 DIPLOMA IN EDUCATION STUDIES (RQF)"),
-            ("unit_number", "UNIT 01"),
-            ("chapter_name", "CHAPTER 01"),
+            ("course_name", DEFAULT_COURSE_NAME),
+            ("unit_number", DEFAULT_UNIT_NUMBER),
+            ("chapter_name", DEFAULT_CHAPTER_NAME),
         )
     )
     preview_done = details_done and _intro_path(brand) is not None
@@ -2431,15 +2503,15 @@ def main():
             )
             course = st.text_input(
                 "Course name",
-                "LEVEL 4 DIPLOMA IN EDUCATION STUDIES (RQF)",
+                DEFAULT_COURSE_NAME,
                 key="course_name",
                 help="The full course name is always shown. Long names wrap automatically.",
             )
             details_left, details_right = st.columns(2)
             with details_left:
-                unit = st.text_input("Unit number", "UNIT 01", key="unit_number")
+                unit = st.text_input("Unit number", DEFAULT_UNIT_NUMBER, key="unit_number")
             with details_right:
-                chapter = st.text_input("Chapter name", "CHAPTER 01", key="chapter_name")
+                chapter = st.text_input("Chapter name", DEFAULT_CHAPTER_NAME, key="chapter_name")
 
         # 2 · Intro preview
         with st.container(border=True):
@@ -2484,6 +2556,23 @@ def main():
                 key="video_uploads",
                 help="Choose one or more original SLC lesson videos.",
             )
+
+            if uploads and len(uploads) == 1:
+                detected_course, detected_unit, detected_chapter = infer_intro_fields_from_filename(
+                    uploads[0].name
+                )
+                if detected_unit and detected_chapter:
+                    will_use_detected = (
+                        str(unit).strip().upper() == DEFAULT_UNIT_NUMBER
+                        or str(chapter).strip().upper() == DEFAULT_CHAPTER_NAME
+                        or str(course).strip().upper() == DEFAULT_COURSE_NAME
+                    )
+                    if will_use_detected:
+                        st.info(
+                            "Filename details detected: "
+                            f"{detected_course or course} · {detected_unit} · {detected_chapter}. "
+                            "These will be used for the queued job wherever the fields above still contain defaults."
+                        )
 
             trim_left, trim_right = st.columns(2)
             with trim_left:
@@ -2602,6 +2691,9 @@ def main():
                 for uploaded in uploads:
                     src = upload_cache_path(uploaded, cache_dir)
                     stem = Path(uploaded.name).stem
+                    job_course, job_unit, job_chapter = resolve_intro_fields_for_job(
+                        uploaded.name, course, unit, chapter
+                    )
                     if len(uploads) == 1 and custom_name:
                         out_name = safe_name(custom_name, stem, brand)
                     else:
@@ -2611,9 +2703,9 @@ def main():
                             src,
                             uploaded.name,
                             brand,
-                            course,
-                            unit,
-                            chapter,
+                            job_course,
+                            job_unit,
+                            job_chapter,
                             trim_start,
                             outro_remove,
                             out_name,
